@@ -313,6 +313,67 @@ def validate_mesh(mesh):
     return metrics
 
 
+def remove_slivers(mesh, min_area_ratio=0.001):
+    """Remove sliver triangles (near-zero area relative to median).
+
+    Marching cubes often creates very thin triangles at grid boundaries.
+    These cause visual spikes and rendering artifacts.
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+    min_area_ratio : float
+        Minimum area as fraction of median face area.
+    """
+    try:
+        areas = mesh.area_faces
+        positive = areas[areas > 0]
+        if len(positive) == 0:
+            return mesh
+
+        median_area = np.median(positive)
+        threshold = median_area * min_area_ratio
+        good_faces = areas >= threshold
+        removed = (~good_faces).sum()
+
+        if removed > 0:
+            mesh.update_faces(good_faces)
+            mesh.remove_unreferenced_vertices()
+            logger.info("remove_slivers: removed %d sliver faces (threshold %.6f).",
+                        removed, threshold)
+    except Exception as exc:
+        logger.warning("remove_slivers: failed (%s); skipping.", exc)
+
+    return mesh
+
+
+def make_watertight(mesh):
+    """Enforce watertight mesh by merging close vertices and filling holes.
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+    """
+    try:
+        mesh.merge_vertices()
+        logger.info("make_watertight: merged close vertices.")
+    except Exception as exc:
+        logger.warning("make_watertight: merge_vertices failed (%s).", exc)
+
+    try:
+        trimesh.repair.fill_holes(mesh)
+        logger.info("make_watertight: filled holes.")
+    except Exception as exc:
+        logger.warning("make_watertight: fill_holes failed (%s).", exc)
+
+    try:
+        mesh.remove_unreferenced_vertices()
+    except Exception:
+        pass
+
+    return mesh
+
+
 def repair_and_prepare(mesh, decimate_ratio=None, smooth_iterations=3):
     """High-level repair pipeline: validate, clean, and optionally simplify.
 
@@ -348,23 +409,36 @@ def repair_and_prepare(mesh, decimate_ratio=None, smooth_iterations=3):
     logger.info("repair_and_prepare: initial validation.")
     validate_mesh(mesh)
 
-    # Step 2 -- remove small components
+    # Step 2 -- remove slivers (near-zero area faces from marching cubes)
+    mesh = remove_slivers(mesh)
+
+    # Step 3 -- remove small components
     mesh = remove_small_components(mesh)
 
-    # Step 3 -- fix topology
+    # Step 4 -- fix topology
     mesh = fix_topology(mesh)
 
-    # Step 4 -- optional smoothing
+    # Step 5 -- enforce watertight
+    mesh = make_watertight(mesh)
+
+    # Step 6 -- optional smoothing
     if smooth_iterations and smooth_iterations > 0:
         mesh = smooth_mesh(mesh, iterations=smooth_iterations)
     else:
         logger.info("repair_and_prepare: smoothing skipped (iterations=0).")
 
-    # Step 5 -- optional decimation
+    # Step 7 -- optional decimation
     if decimate_ratio is not None:
         mesh = decimate_mesh(mesh, target_ratio=decimate_ratio)
     else:
         logger.info("repair_and_prepare: decimation skipped (no ratio given).")
+
+    # Step 8 -- recalculate normals after all modifications
+    try:
+        trimesh.repair.fix_normals(mesh)
+        logger.info("repair_and_prepare: normals recalculated.")
+    except Exception:
+        pass
 
     # Step 6 -- final validation
     logger.info("repair_and_prepare: final validation.")

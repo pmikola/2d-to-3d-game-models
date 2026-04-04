@@ -118,6 +118,13 @@ class Pipeline:
                 model_path=self.config.hunyuan3d_model_path,
             )
             logger.info("Using Hunyuan3D-2.1 backend (geometry + PBR texturing).")
+        elif self.config.backend == "triposg":
+            from .triposg import TripoSGWrapper
+
+            self.geometry_generator = TripoSGWrapper(
+                device_config=self.device_config,
+            )
+            logger.info("Using TripoSG backend (geometry only, ~8GB VRAM).")
         else:
             # Default: Hi3DGen + Text2Tex two-stage pipeline
             self.geometry_generator = Hi3DGenWrapper(
