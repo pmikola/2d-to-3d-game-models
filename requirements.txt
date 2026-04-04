@@ -18,6 +18,9 @@ transformers>=4.27.4
 accelerate>=0.20.0
 safetensors>=0.3.0
 
+# Model download & management
+huggingface_hub>=0.20.0
+
 # Configuration & utilities
 pyyaml>=6.0
 tqdm>=4.65

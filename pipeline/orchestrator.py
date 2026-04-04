@@ -18,8 +18,10 @@ from pathlib import Path
 from PIL import Image
 
 from .device import DeviceConfig, detect_device, log_device_info
-from .export import export_textured_dir_to_glb, validate_glb
+from .export import export_textured_dir_to_glb, export_to_glb, validate_glb
 from .geometry import Hi3DGenWrapper, normalize_mesh, save_mesh_as_obj, unwrap_uvs
+from .mesh_repair import repair_and_prepare
+from .pbr_maps import generate_pbr_maps, save_pbr_maps
 from .preprocess import preprocess_image
 from .texturing import TextureGenerator
 
@@ -29,6 +31,9 @@ logger = logging.getLogger(__name__)
 @dataclass
 class PipelineConfig:
     """Configuration for the full pipeline."""
+
+    # Pipeline backend: "hi3dgen" (default) or "hunyuan3d"
+    backend: str = "hi3dgen"
 
     # Preprocessing
     target_size: int = 512
@@ -43,9 +48,18 @@ class PipelineConfig:
     texture_prompt: str | None = None  # Auto-generated if None
     texture_seed: int = 42
 
+    # Mesh repair
+    mesh_repair: bool = True
+    mesh_smooth_iterations: int = 3
+    mesh_decimate_ratio: float | None = None  # None = no decimation
+
+    # PBR map generation
+    generate_pbr: bool = True
+
     # Paths
     hi3dgen_path: str | None = None
     text2tex_path: str | None = None
+    hunyuan3d_model_path: str | None = None
 
     # Runtime
     force_cpu: bool = False
@@ -83,29 +97,38 @@ class Pipeline:
         self.device_config: DeviceConfig | None = None
         self.geometry_generator: Hi3DGenWrapper | None = None
         self.texture_generator: TextureGenerator | None = None
+        self._hunyuan3d = None  # Lazy-loaded Hunyuan3D wrapper
 
     def initialize(self) -> None:
         """Initialize device detection and model loading."""
         logger.info("=" * 60)
         logger.info("Initializing 2D-to-3D Pipeline")
+        logger.info(f"  Backend: {self.config.backend}")
         logger.info("=" * 60)
 
         # Detect hardware
         self.device_config = detect_device(force_cpu=self.config.force_cpu)
         log_device_info(self.device_config)
 
-        # Initialize geometry generator
-        self.geometry_generator = Hi3DGenWrapper(
-            device_config=self.device_config,
-            hi3dgen_path=self.config.hi3dgen_path,
-        )
+        if self.config.backend == "hunyuan3d":
+            from .hunyuan3d import Hunyuan3DWrapper
 
-        # Initialize texture generator
-        if not self.config.skip_texturing:
-            self.texture_generator = TextureGenerator(
+            self._hunyuan3d = Hunyuan3DWrapper(
                 device_config=self.device_config,
-                text2tex_path=self.config.text2tex_path,
+                model_path=self.config.hunyuan3d_model_path,
             )
+            logger.info("Using Hunyuan3D-2.1 backend (geometry + PBR texturing).")
+        else:
+            # Default: Hi3DGen + Text2Tex two-stage pipeline
+            self.geometry_generator = Hi3DGenWrapper(
+                device_config=self.device_config,
+                hi3dgen_path=self.config.hi3dgen_path,
+            )
+            if not self.config.skip_texturing:
+                self.texture_generator = TextureGenerator(
+                    device_config=self.device_config,
+                    text2tex_path=self.config.text2tex_path,
+                )
 
         logger.info("Pipeline initialized.")
 
@@ -147,49 +170,111 @@ class Pipeline:
             preprocessed.save(str(preprocessed_path))
             logger.info(f"Saved preprocessed image: {preprocessed_path}")
 
-            # Stage 1: Geometry generation
-            logger.info("[Stage 1/4] Generating 3D geometry (Hi3DGen)...")
-            mesh = self.geometry_generator.generate_mesh(
-                image=preprocessed,
-                seed=self.config.geometry_seed,
-                guidance_scale=self.config.geometry_guidance_scale,
-                num_inference_steps=self.config.geometry_steps,
-            )
+            # --- Hunyuan3D backend (single-stage geometry + PBR texturing) ---
+            if self.config.backend == "hunyuan3d" and self._hunyuan3d is not None:
+                logger.info("[Stage 1/2] Generating geometry + textures (Hunyuan3D-2.1)...")
+                hy_result = self._hunyuan3d.generate(
+                    image=preprocessed,
+                    seed=self.config.geometry_seed,
+                    guidance_scale=self.config.geometry_guidance_scale,
+                    num_steps=self.config.geometry_steps,
+                )
+                mesh = hy_result["mesh"]
+                result.mesh_vertices = len(mesh.vertices)
+                result.mesh_faces = len(mesh.faces)
 
-            result.mesh_vertices = len(mesh.vertices)
-            result.mesh_faces = len(mesh.faces)
-
-            # Normalize mesh
-            normalize_mesh(mesh)
-
-            # UV unwrap for texturing
-            logger.info("[Stage 2/4] UV unwrapping...")
-            unwrap_uvs(mesh)
-
-            # Save intermediate OBJ
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                obj_path = save_mesh_as_obj(mesh, tmp_dir)
-
-                # Stage 2: Texturing
-                if not self.config.skip_texturing and self.texture_generator is not None:
-                    logger.info("[Stage 3/4] Generating textures (Text2Tex/diffusers)...")
-                    textured_dir = self.texture_generator.generate_texture(
-                        mesh_obj_path=obj_path,
-                        output_dir=str(Path(tmp_dir) / "textured"),
-                        prompt=self.config.texture_prompt,
-                        original_image=preprocessed,
-                        seed=self.config.texture_seed,
+                # Mesh repair
+                if self.config.mesh_repair:
+                    logger.info("[Stage 1.5/2] Repairing mesh...")
+                    mesh = repair_and_prepare(
+                        mesh,
+                        decimate_ratio=self.config.mesh_decimate_ratio,
+                        smooth_iterations=self.config.mesh_smooth_iterations,
                     )
 
-                    # Stage 3: Export to GLB
-                    logger.info("[Stage 4/4] Exporting to GLB...")
-                    export_textured_dir_to_glb(textured_dir, output_path)
-                else:
-                    # Export geometry-only GLB
-                    logger.info("[Stage 4/4] Exporting geometry-only GLB...")
-                    from .export import export_to_glb
+                normalize_mesh(mesh)
 
-                    export_to_glb(obj_path, None, output_path)
+                # Export with Hunyuan3D's PBR textures if available
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    obj_path = save_mesh_as_obj(mesh, tmp_dir)
+                    texture_path = None
+                    if hy_result.get("texture"):
+                        texture_path = str(Path(tmp_dir) / "albedo.png")
+                        hy_result["texture"].save(texture_path)
+
+                    # Save PBR maps from Hunyuan3D output
+                    pbr_dir = Path(tmp_dir) / "pbr"
+                    pbr_dir.mkdir(exist_ok=True)
+                    for map_name in ("normal_map", "metallic_map", "roughness_map"):
+                        if hy_result.get(map_name):
+                            hy_result[map_name].save(str(pbr_dir / f"{map_name}.png"))
+
+                    logger.info("[Stage 2/2] Exporting to GLB...")
+                    export_to_glb(obj_path, texture_path, output_path)
+
+            # --- Hi3DGen + Text2Tex backend (two-stage) ---
+            else:
+                logger.info("[Stage 1/5] Generating 3D geometry (Hi3DGen)...")
+                mesh = self.geometry_generator.generate_mesh(
+                    image=preprocessed,
+                    seed=self.config.geometry_seed,
+                    guidance_scale=self.config.geometry_guidance_scale,
+                    num_inference_steps=self.config.geometry_steps,
+                )
+
+                result.mesh_vertices = len(mesh.vertices)
+                result.mesh_faces = len(mesh.faces)
+
+                # Mesh repair (new)
+                if self.config.mesh_repair:
+                    logger.info("[Stage 2/5] Repairing mesh...")
+                    mesh = repair_and_prepare(
+                        mesh,
+                        decimate_ratio=self.config.mesh_decimate_ratio,
+                        smooth_iterations=self.config.mesh_smooth_iterations,
+                    )
+                    result.mesh_vertices = len(mesh.vertices)
+                    result.mesh_faces = len(mesh.faces)
+
+                # Normalize mesh
+                normalize_mesh(mesh)
+
+                # UV unwrap for texturing
+                logger.info("[Stage 3/5] UV unwrapping...")
+                unwrap_uvs(mesh)
+
+                # Save intermediate OBJ
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    obj_path = save_mesh_as_obj(mesh, tmp_dir)
+
+                    # Texturing
+                    if not self.config.skip_texturing and self.texture_generator is not None:
+                        logger.info("[Stage 4/5] Generating textures (Text2Tex/diffusers)...")
+                        textured_dir = self.texture_generator.generate_texture(
+                            mesh_obj_path=obj_path,
+                            output_dir=str(Path(tmp_dir) / "textured"),
+                            prompt=self.config.texture_prompt,
+                            original_image=preprocessed,
+                            seed=self.config.texture_seed,
+                        )
+
+                        # PBR map generation (new)
+                        if self.config.generate_pbr:
+                            texture_atlas = Path(textured_dir) / "texture_atlas.png"
+                            if texture_atlas.exists():
+                                logger.info("[Stage 4.5/5] Generating PBR maps...")
+                                from PIL import Image as PILImage
+                                albedo = PILImage.open(texture_atlas)
+                                pbr_maps = generate_pbr_maps(albedo)
+                                save_pbr_maps(pbr_maps, str(Path(textured_dir) / "pbr"))
+
+                        # Export to GLB
+                        logger.info("[Stage 5/5] Exporting to GLB...")
+                        export_textured_dir_to_glb(textured_dir, output_path)
+                    else:
+                        # Export geometry-only GLB
+                        logger.info("[Stage 5/5] Exporting geometry-only GLB...")
+                        export_to_glb(obj_path, None, output_path)
 
             # Validate output
             validation = validate_glb(output_path)

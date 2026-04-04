@@ -1,6 +1,10 @@
 # Default configuration for 2D-to-3D Pipeline
 # Override via CLI arguments or by editing this file.
 
+# Pipeline backend: "hi3dgen" (two-stage) or "hunyuan3d" (single-stage with PBR)
+pipeline:
+  backend: "hi3dgen"           # "hi3dgen" = Hi3DGen + Text2Tex, "hunyuan3d" = Hunyuan3D-2.1
+
 # Preprocessing
 preprocessing:
   target_size: 512           # Image resize target (matches Hi3DGen's NiRNE input)
@@ -24,6 +28,18 @@ texturing:
   strength: 0.7
   model_id: "stabilityai/stable-diffusion-2-depth"
   caption_model: "Salesforce/blip-image-captioning-base"
+
+# Mesh Repair (post-geometry, pre-texturing)
+mesh_repair:
+  enabled: true
+  smooth_iterations: 3         # Taubin smoothing iterations (0 to skip)
+  decimate_ratio: null         # Ratio of faces to keep (null = no decimation, 0.5 = 50%)
+
+# PBR Map Generation
+pbr:
+  enabled: true                # Generate normal, roughness, metallic maps
+  normal_strength: 1.0         # Normal map intensity
+  base_roughness: 0.7          # Base roughness value
 
 # Export
 export:

@@ -49,12 +49,16 @@ def load_config_from_yaml(yaml_path: str) -> PipelineConfig:
     with open(yaml_path, "r") as f:
         data = yaml.safe_load(f) or {}
 
+    pipeline_cfg = data.get("pipeline", {})
     preprocessing = data.get("preprocessing", {})
     geometry = data.get("geometry", {})
     texturing = data.get("texturing", {})
     device = data.get("device", {})
+    mesh_repair = data.get("mesh_repair", {})
+    pbr = data.get("pbr", {})
 
     return PipelineConfig(
+        backend=pipeline_cfg.get("backend", "hi3dgen"),
         target_size=preprocessing.get("target_size", 512),
         remove_background=preprocessing.get("remove_background", True),
         geometry_seed=geometry.get("seed", 42),
@@ -62,6 +66,10 @@ def load_config_from_yaml(yaml_path: str) -> PipelineConfig:
         geometry_steps=geometry.get("num_inference_steps", 50),
         texture_seed=texturing.get("seed", 42),
         texture_prompt=texturing.get("prompt", None),
+        mesh_repair=mesh_repair.get("enabled", True),
+        mesh_smooth_iterations=mesh_repair.get("smooth_iterations", 3),
+        mesh_decimate_ratio=mesh_repair.get("decimate_ratio", None),
+        generate_pbr=pbr.get("enabled", True),
         force_cpu=device.get("force_cpu", False),
     )
 
@@ -121,6 +129,15 @@ Examples:
         type=str,
         default="./output",
         help="Output directory for batch processing (default: ./output)",
+    )
+
+    # Pipeline backend
+    parser.add_argument(
+        "--backend",
+        type=str,
+        choices=["hi3dgen", "hunyuan3d"],
+        default=None,
+        help="Pipeline backend: 'hi3dgen' (two-stage) or 'hunyuan3d' (single-stage with PBR)",
     )
 
     # Pipeline options
@@ -223,6 +240,9 @@ def main() -> int:
         config = PipelineConfig()
 
     # -- Override with explicitly provided CLI args (highest priority) --
+    if _cli_arg_was_provided("--backend"):
+        config.backend = args.backend
+
     # store_true flags: if the user passed them, they are True.
     if args.force_cpu:
         config.force_cpu = True
