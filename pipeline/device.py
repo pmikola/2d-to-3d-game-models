@@ -74,7 +74,7 @@ def detect_device(force_cpu: bool = False) -> DeviceConfig:
 
     # GPU is available
     gpu_props = torch.cuda.get_device_properties(0)
-    vram_gb = gpu_props.total_mem / (1024**3)
+    vram_gb = gpu_props.total_memory / (1024**3)
     gpu_name = gpu_props.name
 
     logger.info(f"Detected GPU: {gpu_name} with {vram_gb:.1f} GB VRAM")
