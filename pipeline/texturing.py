@@ -17,6 +17,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 
 logger = logging.getLogger(__name__)
@@ -90,8 +91,8 @@ class TextureGenerator:
         if self.device_config.has_gpu:
             try:
                 pipe.enable_attention_slicing()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Could not enable attention slicing: {e}")
 
         self._sd_pipeline = pipe
 
@@ -276,7 +277,6 @@ class TextureGenerator:
         """
         import torch
         import trimesh
-        import numpy as np
 
         logger.info("Running diffusers-based multi-view texturing (fallback mode)...")
 
@@ -329,11 +329,17 @@ class TextureGenerator:
                 logger.warning(f"  Failed to generate texture for viewpoint {i}: {e}")
                 continue
 
-        # Project textures back onto mesh UV space
-        # For the fallback mode, we use the front view as primary texture
-        front_texture_path = output_path / "view_000.png"
-        if front_texture_path.exists():
-            texture_image = Image.open(front_texture_path)
+        # Check if any textures were generated
+        generated_views = sorted(output_path.glob("view_*.png"))
+        if not generated_views:
+            logger.warning(
+                "No texture views were generated successfully. "
+                "The output will have a placeholder gray texture."
+            )
+        else:
+            logger.info(f"Successfully generated {len(generated_views)} texture views.")
+            # Use the best available view as primary texture
+            texture_image = Image.open(generated_views[0])
 
         # Save the texture atlas
         texture_atlas_path = output_path / "texture_atlas.png"
@@ -388,8 +394,6 @@ class TextureGenerator:
             camera = pyrender.PerspectiveCamera(yfov=np.pi / 3.0)
 
             # Camera pose from azimuth/elevation
-            import numpy as np
-
             az_rad = np.radians(azimuth)
             el_rad = np.radians(elevation)
             distance = 2.0
@@ -419,8 +423,6 @@ class TextureGenerator:
         except ImportError:
             logger.debug("pyrender not available, generating synthetic depth map.")
             # Generate a simple synthetic depth map as placeholder
-            import numpy as np
-
             depth = np.zeros((resolution, resolution), dtype=np.uint8)
             center = resolution // 2
             radius = resolution // 3
@@ -436,8 +438,6 @@ class TextureGenerator:
     @staticmethod
     def _look_at(eye, target, up):
         """Create a look-at camera matrix."""
-        import numpy as np
-
         forward = target - eye
         forward = forward / np.linalg.norm(forward)
 
@@ -456,8 +456,6 @@ class TextureGenerator:
 
     def _save_textured_obj(self, mesh, output_dir: Path, texture_path: Path) -> None:
         """Save mesh as OBJ with material referencing the texture atlas."""
-        import trimesh
-
         # Create MTL file
         mtl_path = output_dir / "mesh.mtl"
         with open(mtl_path, "w") as f:

@@ -269,10 +269,14 @@ def unwrap_uvs(mesh) -> None:
         # Update mesh with UV data
         mesh.vertices = vertices[vmapping]
         mesh.faces = new_faces
-        mesh.visual = mesh.visual.__class__(
-            uv=uvs,
-            material=None,
-        )
+        try:
+            import trimesh
+
+            mesh.visual = trimesh.visual.TextureVisuals(uv=uvs)
+        except Exception as e:
+            logger.warning(f"Could not set UV visual via TextureVisuals: {e}")
+            # Fallback: try setting UVs directly
+            mesh.visual = mesh.visual.__class__(uv=uvs, material=None)
 
         logger.info(
             f"UV unwrapping complete. "
@@ -280,12 +284,10 @@ def unwrap_uvs(mesh) -> None:
         )
 
     except ImportError:
-        logger.warning(
-            "xatlas not installed. UV unwrapping skipped. "
-            "Install with: pip install xatlas. "
-            "UV maps are required for texture generation."
+        raise ImportError(
+            "xatlas is required for UV unwrapping but is not installed. "
+            "Install with: pip install xatlas"
         )
-        raise
 
 
 def save_mesh_as_obj(mesh, output_path: str) -> str:

@@ -19,6 +19,8 @@ import logging
 import sys
 from pathlib import Path
 
+import yaml
+
 from pipeline.orchestrator import Pipeline, PipelineConfig
 
 
@@ -29,6 +31,38 @@ def setup_logging(verbose: bool = False) -> None:
         level=level,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+
+def load_config_from_yaml(yaml_path: str) -> PipelineConfig:
+    """Load a PipelineConfig from a YAML config file.
+
+    Reads the nested YAML structure and maps keys to PipelineConfig fields.
+    Missing keys are handled gracefully with defaults.
+
+    Args:
+        yaml_path: Path to the YAML configuration file.
+
+    Returns:
+        A PipelineConfig populated from the YAML values.
+    """
+    with open(yaml_path, "r") as f:
+        data = yaml.safe_load(f) or {}
+
+    preprocessing = data.get("preprocessing", {})
+    geometry = data.get("geometry", {})
+    texturing = data.get("texturing", {})
+    device = data.get("device", {})
+
+    return PipelineConfig(
+        target_size=preprocessing.get("target_size", 512),
+        remove_background=preprocessing.get("remove_background", True),
+        geometry_seed=geometry.get("seed", 42),
+        geometry_guidance_scale=geometry.get("guidance_scale", 7.5),
+        geometry_steps=geometry.get("num_inference_steps", 50),
+        texture_seed=texturing.get("seed", 42),
+        texture_prompt=texturing.get("prompt", None),
+        force_cpu=device.get("force_cpu", False),
     )
 
 
@@ -56,6 +90,14 @@ Examples:
 """,
     )
 
+    # Config file
+    parser.add_argument(
+        "--config", "-c",
+        type=str,
+        default=None,
+        help="Path to YAML config file (default: configs/default.yaml if it exists)",
+    )
+
     # Input/output
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument(
@@ -72,7 +114,7 @@ Examples:
     parser.add_argument(
         "--output", "-o",
         type=str,
-        help="Output path for single image (.GLB file) or output directory for batch",
+        help="Output .GLB file path (single image mode)",
     )
     parser.add_argument(
         "--output-dir",
@@ -148,24 +190,61 @@ Examples:
     return parser.parse_args()
 
 
+def _cli_arg_was_provided(arg_name: str) -> bool:
+    """Check whether a CLI argument was explicitly provided by the user.
+
+    Scans sys.argv for the flag string (e.g. ``--target-size``) so we can
+    distinguish "user passed --seed 42" from "argparse default is 42".
+    """
+    return any(a.startswith(arg_name) for a in sys.argv[1:])
+
+
 def main() -> int:
     """Main entry point."""
     args = parse_args()
     setup_logging(verbose=args.verbose)
 
-    # Build pipeline config
-    config = PipelineConfig(
-        target_size=args.target_size,
-        remove_background=not args.no_bg_removal,
-        geometry_seed=args.seed,
-        geometry_steps=args.geometry_steps,
-        texture_prompt=args.prompt,
-        texture_seed=args.seed,
-        hi3dgen_path=args.hi3dgen_path,
-        text2tex_path=args.text2tex_path,
-        force_cpu=args.force_cpu,
-        skip_texturing=args.skip_texturing,
-    )
+    logger = logging.getLogger(__name__)
+
+    # -- Load YAML config (base layer) --
+    yaml_path = args.config
+    if yaml_path is None:
+        # Auto-detect configs/default.yaml relative to this script
+        script_dir = Path(__file__).resolve().parent
+        candidate = script_dir / "configs" / "default.yaml"
+        if candidate.is_file():
+            yaml_path = str(candidate)
+            logger.info(f"Auto-detected config: {yaml_path}")
+
+    if yaml_path is not None:
+        logger.info(f"Loading config from: {yaml_path}")
+        config = load_config_from_yaml(yaml_path)
+    else:
+        config = PipelineConfig()
+
+    # -- Override with explicitly provided CLI args (highest priority) --
+    # store_true flags: if the user passed them, they are True.
+    if args.force_cpu:
+        config.force_cpu = True
+    if args.skip_texturing:
+        config.skip_texturing = True
+    if args.no_bg_removal:
+        config.remove_background = False
+
+    # Value-based args: only override YAML when explicitly provided on CLI.
+    if _cli_arg_was_provided("--target-size"):
+        config.target_size = args.target_size
+    if _cli_arg_was_provided("--geometry-steps"):
+        config.geometry_steps = args.geometry_steps
+    if _cli_arg_was_provided("--seed"):
+        config.geometry_seed = args.seed
+        config.texture_seed = args.seed
+    if _cli_arg_was_provided("--prompt") or _cli_arg_was_provided("-p"):
+        config.texture_prompt = args.prompt
+    if _cli_arg_was_provided("--hi3dgen-path"):
+        config.hi3dgen_path = args.hi3dgen_path
+    if _cli_arg_was_provided("--text2tex-path"):
+        config.text2tex_path = args.text2tex_path
 
     pipeline = Pipeline(config)
 
@@ -190,9 +269,11 @@ def main() -> int:
             return 1
 
     elif args.batch_dir:
-        # Batch mode
+        # Batch mode — use --output-dir (--output is ignored in batch mode)
         output_dir = args.output_dir
-        if args.output:
+        if args.output and not _cli_arg_was_provided("--output-dir"):
+            logger.warning("--output is for single-image mode. Using --output-dir for batch. "
+                           "Pass --output-dir explicitly for batch output location.")
             output_dir = args.output
 
         results = pipeline.process_batch(args.batch_dir, output_dir)
