@@ -1,0 +1,40 @@
+# Default configuration for 2D-to-3D Pipeline
+# Override via CLI arguments or by editing this file.
+
+# Preprocessing
+preprocessing:
+  target_size: 512           # Image resize target (matches Hi3DGen's NiRNE input)
+  remove_background: true    # Use rembg for background removal
+  quality_check: true        # Warn on low-res or blurry images
+
+# Geometry Generation (Hi3DGen)
+geometry:
+  seed: 42
+  guidance_scale: 7.5
+  num_inference_steps: 50
+  model_id: "Stable-X/trellis-normal-v0-1"
+
+# Texture Generation (Text2Tex / diffusers fallback)
+texturing:
+  seed: 42
+  prompt: null               # Auto-generated from input image if null
+  num_viewpoints: 36         # Reduced automatically for low VRAM / CPU
+  ddim_steps: 50             # Reduced automatically for low VRAM / CPU
+  guidance_scale: 7.5
+  strength: 0.7
+  model_id: "stabilityai/stable-diffusion-2-depth"
+  caption_model: "Salesforce/blip-image-captioning-base"
+
+# Export
+export:
+  format: "glb"              # Output format (glb = binary glTF 2.0)
+  embed_textures: true       # Embed textures in GLB file
+  metallic_factor: 0.0       # PBR metallic factor
+  roughness_factor: 0.8      # PBR roughness factor
+
+# Hardware
+device:
+  force_cpu: false
+  vram_min_geometry: 8.0     # GB — fallback to CPU if below this
+  vram_min_texturing: 10.0   # GB — reduce texture quality if below this
+  vram_comfortable: 16.0     # GB — full quality settings
