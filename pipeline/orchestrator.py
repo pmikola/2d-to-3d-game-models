@@ -12,7 +12,7 @@ Chains the full 2D-to-3D pipeline:
 import logging
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from PIL import Image

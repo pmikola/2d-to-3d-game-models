@@ -17,14 +17,20 @@ def export_to_glb(
     mesh_path: str,
     texture_path: str | None,
     output_path: str,
+    normal_map_path: str | None = None,
+    roughness_map_path: str | None = None,
+    metallic_map_path: str | None = None,
 ) -> str:
     """
-    Export a textured mesh to GLB format with embedded textures.
+    Export a textured mesh to GLB format with embedded textures and PBR maps.
 
     Args:
         mesh_path: Path to the .OBJ mesh file.
-        texture_path: Path to the texture image (PNG/JPG). If None, exports without texture.
+        texture_path: Path to the albedo texture image (PNG/JPG). If None, exports without texture.
         output_path: Path for the output .GLB file.
+        normal_map_path: Path to normal map image. If None, omitted from material.
+        roughness_map_path: Path to roughness map image. If None, omitted from material.
+        metallic_map_path: Path to metallic map image. If None, omitted from material.
 
     Returns:
         Path to the exported .GLB file.
@@ -44,12 +50,26 @@ def export_to_glb(
         texture_image = Image.open(texture_path)
         logger.info(f"  Texture size: {texture_image.size}")
 
-        # Create material with the texture
-        material = trimesh.visual.material.PBRMaterial(
-            baseColorTexture=texture_image,
-            metallicFactor=0.0,
-            roughnessFactor=0.8,
-        )
+        # Build PBR material kwargs
+        pbr_kwargs = {
+            "baseColorTexture": texture_image,
+            "metallicFactor": 0.0,
+            "roughnessFactor": 0.8,
+        }
+
+        # Add PBR maps if available
+        if normal_map_path and Path(normal_map_path).exists():
+            pbr_kwargs["normalTexture"] = Image.open(normal_map_path)
+            logger.info(f"  Normal map: {normal_map_path}")
+        if roughness_map_path and Path(roughness_map_path).exists():
+            pbr_kwargs["roughnessTexture"] = Image.open(roughness_map_path)
+            logger.info(f"  Roughness map: {roughness_map_path}")
+        if metallic_map_path and Path(metallic_map_path).exists():
+            pbr_kwargs["metallicTexture"] = Image.open(metallic_map_path)
+            logger.info(f"  Metallic map: {metallic_map_path}")
+
+        # Create PBR material
+        material = trimesh.visual.material.PBRMaterial(**pbr_kwargs)
 
         # Apply texture to mesh
         if hasattr(mesh.visual, "uv") and mesh.visual.uv is not None:
@@ -62,7 +82,6 @@ def export_to_glb(
                 "Mesh has no UV coordinates. Texture will not be applied correctly. "
                 "Ensure UV unwrapping was performed during geometry generation."
             )
-            # Try to apply anyway — trimesh may handle it
             mesh.visual = trimesh.visual.TextureVisuals(material=material)
     else:
         logger.info("No texture provided — exporting geometry only.")
@@ -125,7 +144,28 @@ def export_textured_dir_to_glb(textured_dir: str, output_path: str) -> str:
             break
 
     texture_str = str(texture_path) if texture_path else None
-    return export_to_glb(str(obj_path), texture_str, output_path)
+
+    # Look for PBR maps in a 'pbr' subdirectory
+    pbr_dir = textured_path / "pbr"
+    normal_map = None
+    roughness_map = None
+    metallic_map = None
+    if pbr_dir.is_dir():
+        for f in pbr_dir.glob("normal_map.*"):
+            normal_map = str(f)
+        for f in pbr_dir.glob("roughness_map.*"):
+            roughness_map = str(f)
+        for f in pbr_dir.glob("metallic_map.*"):
+            metallic_map = str(f)
+
+    return export_to_glb(
+        str(obj_path),
+        texture_str,
+        output_path,
+        normal_map_path=normal_map,
+        roughness_map_path=roughness_map,
+        metallic_map_path=metallic_map,
+    )
 
 
 def validate_glb(glb_path: str) -> dict:

@@ -70,6 +70,8 @@ def load_config_from_yaml(yaml_path: str) -> PipelineConfig:
         mesh_smooth_iterations=mesh_repair.get("smooth_iterations", 3),
         mesh_decimate_ratio=mesh_repair.get("decimate_ratio", None),
         generate_pbr=pbr.get("enabled", True),
+        hunyuan3d_model_path=pipeline_cfg.get("hunyuan3d_model_path", None),
+        skip_texturing=pipeline_cfg.get("skip_texturing", False),
         force_cpu=device.get("force_cpu", False),
     )
 
