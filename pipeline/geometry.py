@@ -166,7 +166,7 @@ class Hi3DGenWrapper:
             # Run the Hi3DGen / TRELLIS pipeline
             with torch.no_grad():
                 if self.device_config.has_gpu:
-                    with torch.cuda.amp.autocast(dtype=self.device_config.dtype):
+                    with torch.autocast(device_type="cuda", dtype=self.device_config.dtype):
                         outputs = self.pipeline(
                             image,
                             seed=seed,

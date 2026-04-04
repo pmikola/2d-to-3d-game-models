@@ -207,24 +207,107 @@ def decimate_mesh(mesh, target_face_count=None, target_ratio=0.5):
         target / current_faces,
     )
 
+    def _decimate_with_pymeshlab():
+        try:
+            import pymeshlab
+        except ImportError:
+            logger.warning(
+                "decimate_mesh: pymeshlab not installed; returning original mesh."
+            )
+            return mesh
+
+        try:
+            mesh_set = pymeshlab.MeshSet()
+            mesh_set.add_mesh(
+                pymeshlab.Mesh(
+                    vertex_matrix=np.asarray(mesh.vertices, dtype=np.float64),
+                    face_matrix=np.asarray(mesh.faces, dtype=np.int32),
+                ),
+                "mesh",
+            )
+            mesh_set.meshing_decimation_quadric_edge_collapse(
+                targetfacenum=int(target),
+                preservenormal=True,
+                preservetopology=True,
+            )
+            simplified = mesh_set.current_mesh()
+            decimated = trimesh.Trimesh(
+                vertices=np.asarray(simplified.vertex_matrix()),
+                faces=np.asarray(simplified.face_matrix()),
+                process=False,
+            )
+            logger.info(
+                "decimate_mesh: pymeshlab fallback result has %d faces.",
+                len(decimated.faces),
+            )
+            return decimated
+        except Exception as exc:
+            logger.warning(
+                "decimate_mesh: pymeshlab fallback failed (%s); returning original mesh.",
+                exc,
+            )
+            return mesh
+
     try:
         decimated = mesh.simplify_quadric_decimation(face_count=target)
         logger.info(
             "decimate_mesh: result has %d faces.", len(decimated.faces)
         )
         return decimated
-    except AttributeError:
+    except (AttributeError, ImportError, ModuleNotFoundError) as exc:
         logger.warning(
-            "decimate_mesh: simplify_quadric_decimation not available; "
-            "returning original mesh."
-        )
-        return mesh
-    except Exception as exc:
-        logger.warning(
-            "decimate_mesh: decimation failed (%s); returning original mesh.",
+            "decimate_mesh: trimesh simplification backend unavailable (%s); "
+            "trying pymeshlab fallback.",
             exc,
         )
-        return mesh
+        return _decimate_with_pymeshlab()
+    except Exception as exc:
+        logger.warning(
+            "decimate_mesh: decimation failed (%s); trying pymeshlab fallback.",
+            exc,
+        )
+        return _decimate_with_pymeshlab()
+
+
+def prepare_game_ready_mesh(mesh, target_face_count=50000):
+    """Create a lower-poly mesh without running the legacy repair pipeline.
+
+    This path is intended for the Hunyuan backend, where the full repair pass
+    can be too destructive. We decimate conservatively, keep the existing
+    topology otherwise intact, then recalculate normals for export.
+    """
+    logger.info(
+        "prepare_game_ready_mesh: starting game-ready simplification "
+        "(target faces=%d).",
+        target_face_count,
+    )
+    logger.info("prepare_game_ready_mesh: initial validation.")
+    validate_mesh(mesh)
+
+    mesh = decimate_mesh(mesh, target_face_count=target_face_count)
+
+    try:
+        mesh.remove_unreferenced_vertices()
+    except Exception:
+        pass
+
+    try:
+        trimesh.repair.fix_normals(mesh)
+        logger.info("prepare_game_ready_mesh: normals recalculated.")
+    except Exception as exc:
+        logger.warning(
+            "prepare_game_ready_mesh: normal recalculation failed (%s); skipping.",
+            exc,
+        )
+
+    logger.info("prepare_game_ready_mesh: final validation.")
+    metrics = validate_mesh(mesh)
+    logger.info(
+        "prepare_game_ready_mesh: done. Final mesh: %d verts, %d faces.",
+        metrics["num_vertices"],
+        metrics["num_faces"],
+    )
+    return mesh
 
 
 def validate_mesh(mesh):

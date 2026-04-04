@@ -20,10 +20,18 @@ safetensors>=0.3.0
 
 # Model download & management
 huggingface_hub>=0.20.0
+einops
+omegaconf
+pytorch-lightning
+torchdiffeq
+pymeshlab
 
 # Configuration & utilities
 pyyaml>=6.0
 tqdm>=4.65
+
+# MMGP memory offloading for Hunyuan3D Paint on <24GB VRAM GPUs
+mmgp>=0.9.0
 
 # Optional: GPU acceleration (uncomment for CUDA)
 # xformers>=0.0.27

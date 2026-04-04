@@ -1,9 +1,11 @@
 """
 2D-to-3D Game Models Pipeline
 
-A two-stage SOTA pipeline for converting 2D images to fully textured 3D models:
-  Stage 1 (Geometry): Hi3DGen — high-fidelity 3D geometry from images (ICCV 2025)
-  Stage 2 (Texturing): Text2Tex / TEXTure — diffusion-based multi-view texture painting
+Default pipeline for converting 2D images into geometry-only 3D models:
+  Stage 1 (Geometry): Hunyuan3D-2.1 fp16 shape generation
+  Stage 2 (Export): game-ready decimation, normalization, and GLB export
+
+Legacy Hi3DGen + Text2Tex support remains available through the CLI backend switch.
 """
 
 __version__ = "0.1.0"

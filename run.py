@@ -2,11 +2,14 @@
 """
 2D-to-3D Game Models Pipeline — CLI Entry Point
 
-Convert 2D images (PNG/JPG) to fully textured 3D models (.GLB) for Blender.
+Convert 2D images (PNG/JPG) to 3D shape models (.GLB) for Blender.
 
-Two-stage SOTA pipeline:
-  Stage 1: Hi3DGen (ICCV 2025) — high-fidelity 3D geometry from images
-  Stage 2: Text2Tex / TEXTure — diffusion-based multi-view texture painting
+Default pipeline:
+  Stage 1: Hunyuan3D-2.1 fp16 — high-quality 3D shape generation
+  Stage 2: Game-ready decimation + geometry-only GLB export
+
+Legacy pipeline:
+  Hi3DGen + Text2Tex remains available via `--backend hi3dgen`
 
 Usage:
   python run.py --input photo.png --output model.glb
@@ -56,9 +59,13 @@ def load_config_from_yaml(yaml_path: str) -> PipelineConfig:
     device = data.get("device", {})
     mesh_repair = data.get("mesh_repair", {})
     pbr = data.get("pbr", {})
+    zero123 = data.get("zero123", {})
+    exposure = data.get("exposure", {})
+    shape_mv = data.get("shape_multiview", {})
+    paint = data.get("paint", {})
 
     return PipelineConfig(
-        backend=pipeline_cfg.get("backend", "hi3dgen"),
+        backend=pipeline_cfg.get("backend", "hunyuan3d"),
         target_size=preprocessing.get("target_size", 512),
         remove_background=preprocessing.get("remove_background", True),
         geometry_seed=geometry.get("seed", 42),
@@ -69,17 +76,33 @@ def load_config_from_yaml(yaml_path: str) -> PipelineConfig:
         mesh_repair=mesh_repair.get("enabled", True),
         mesh_smooth_iterations=mesh_repair.get("smooth_iterations", 3),
         mesh_decimate_ratio=mesh_repair.get("decimate_ratio", None),
-        generate_pbr=pbr.get("enabled", True),
+        generate_pbr=pbr.get("enabled", False),
         hunyuan3d_model_path=pipeline_cfg.get("hunyuan3d_model_path", None),
-        skip_texturing=pipeline_cfg.get("skip_texturing", False),
+        skip_texturing=pipeline_cfg.get("skip_texturing", True),
+        game_ready=pipeline_cfg.get("game_ready", True),
+        game_ready_target_faces=pipeline_cfg.get("game_ready_target_faces", 50000),
         force_cpu=device.get("force_cpu", False),
+        # Zero123++ multi-view
+        zero123_steps=zero123.get("num_inference_steps", 75),
+        zero123_guidance_scale=zero123.get("guidance_scale", 4.0),
+        # Exposure correction
+        correct_exposure=exposure.get("enabled", False),
+        exposure_low_percentile=exposure.get("low_percentile", 1.0),
+        exposure_high_percentile=exposure.get("high_percentile", 99.0),
+        # Hunyuan3D-2mv shape
+        shape_octree_resolution=shape_mv.get("octree_resolution", 384),
+        # Hunyuan3D Paint
+        paint_max_views=paint.get("max_views", 6),
+        paint_resolution=paint.get("resolution", 512),
+        paint_use_remesh=paint.get("use_remesh", True),
+        mmgp_profile=paint.get("mmgp_profile", "LowRAM_LowVRAM"),
     )
 
 
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Convert 2D images to textured 3D models (.GLB)",
+        description="Convert 2D images to 3D shape models (.GLB)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -92,11 +115,11 @@ Examples:
   # Force CPU mode
   python run.py --input photo.png --output model.glb --force-cpu
 
-  # Skip texturing (geometry only)
-  python run.py --input photo.png --output model.glb --skip-texturing
+  # Full-resolution mesh (skip game-ready decimation)
+  python run.py --input photo.png --output model.glb --no-game-ready
 
-  # Custom texture prompt
-  python run.py --input photo.png --output model.glb --prompt "medieval stone castle"
+  # Legacy textured pipeline
+  python run.py --input photo.png --output model.glb --backend hi3dgen --prompt "medieval stone castle"
 """,
     )
 
@@ -137,9 +160,15 @@ Examples:
     parser.add_argument(
         "--backend",
         type=str,
-        choices=["hi3dgen", "hunyuan3d"],
+        choices=["hi3dgen", "hunyuan3d", "triposg", "full"],
         default=None,
-        help="Pipeline backend: 'hi3dgen' (two-stage) or 'hunyuan3d' (single-stage with PBR)",
+        help=(
+            "Pipeline backend: 'hunyuan3d' (default) uses Hunyuan3D-2.1 fp16 "
+            "shape generation; 'full' runs the 5-stage pipeline (Zero123++ -> "
+            "Hunyuan3D-2mv -> mesh repair -> Hunyuan3D Paint -> PBR GLB); "
+            "'triposg' uses TripoSG geometry; 'hi3dgen' preserves the legacy "
+            "geometry+texture pipeline"
+        ),
     )
 
     # Pipeline options
@@ -151,7 +180,22 @@ Examples:
     parser.add_argument(
         "--skip-texturing",
         action="store_true",
-        help="Skip texture generation (output geometry-only GLB)",
+        help="Skip texture generation (already enabled by default for Hunyuan3D-2.1)",
+    )
+    parser.add_argument(
+        "--game-ready",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable game-ready decimation for the Hunyuan3D backend "
+            "(use --no-game-ready to keep the full-resolution mesh)"
+        ),
+    )
+    parser.add_argument(
+        "--game-ready-target-faces",
+        type=int,
+        default=None,
+        help="Target face count for game-ready Hunyuan export (default: 50000)",
     )
     parser.add_argument(
         "--no-bg-removal",
@@ -162,7 +206,7 @@ Examples:
         "--prompt", "-p",
         type=str,
         default=None,
-        help="Text prompt for texture generation (auto-generated if not provided)",
+        help="Text prompt for texture generation in the legacy textured pipeline",
     )
 
     # Quality settings
@@ -183,6 +227,38 @@ Examples:
         type=int,
         default=42,
         help="Random seed for reproducibility (default: 42)",
+    )
+
+    # Full pipeline options
+    parser.add_argument(
+        "--correct-exposure",
+        action="store_true",
+        help="Apply dynamic range / exposure correction during preprocessing",
+    )
+    parser.add_argument(
+        "--paint-resolution",
+        type=int,
+        default=None,
+        help="Resolution for Hunyuan3D Paint texturing (default: 512)",
+    )
+    parser.add_argument(
+        "--zero123-steps",
+        type=int,
+        default=None,
+        help="Number of inference steps for Zero123++ multi-view generation (default: 75)",
+    )
+    parser.add_argument(
+        "--octree-resolution",
+        type=int,
+        default=None,
+        help="Octree resolution for Hunyuan3D-2mv shape generation (default: 384)",
+    )
+    parser.add_argument(
+        "--mmgp-profile",
+        type=str,
+        choices=["LowRAM_LowVRAM", "LowRAM_HighVRAM", "HighRAM_LowVRAM", "HighRAM_HighVRAM"],
+        default=None,
+        help="MMGP offloading profile for Hunyuan3D Paint (default: LowRAM_LowVRAM)",
     )
 
     # External tool paths
@@ -250,6 +326,8 @@ def main() -> int:
         config.force_cpu = True
     if args.skip_texturing:
         config.skip_texturing = True
+    if _cli_arg_was_provided("--game-ready") or _cli_arg_was_provided("--no-game-ready"):
+        config.game_ready = args.game_ready
     if args.no_bg_removal:
         config.remove_background = False
 
@@ -258,6 +336,12 @@ def main() -> int:
         config.target_size = args.target_size
     if _cli_arg_was_provided("--geometry-steps"):
         config.geometry_steps = args.geometry_steps
+    if _cli_arg_was_provided("--game-ready-target-faces"):
+        if args.game_ready_target_faces < 4:
+            logger.error("--game-ready-target-faces must be >= 4.")
+            return 1
+        config.game_ready = True
+        config.game_ready_target_faces = args.game_ready_target_faces
     if _cli_arg_was_provided("--seed"):
         config.geometry_seed = args.seed
         config.texture_seed = args.seed
@@ -267,6 +351,18 @@ def main() -> int:
         config.hi3dgen_path = args.hi3dgen_path
     if _cli_arg_was_provided("--text2tex-path"):
         config.text2tex_path = args.text2tex_path
+
+    # Full pipeline overrides
+    if args.correct_exposure:
+        config.correct_exposure = True
+    if _cli_arg_was_provided("--paint-resolution"):
+        config.paint_resolution = args.paint_resolution
+    if _cli_arg_was_provided("--zero123-steps"):
+        config.zero123_steps = args.zero123_steps
+    if _cli_arg_was_provided("--octree-resolution"):
+        config.shape_octree_resolution = args.octree_resolution
+    if _cli_arg_was_provided("--mmgp-profile"):
+        config.mmgp_profile = args.mmgp_profile
 
     pipeline = Pipeline(config)
 

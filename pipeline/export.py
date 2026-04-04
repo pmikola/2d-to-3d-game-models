@@ -57,16 +57,40 @@ def export_to_glb(
             "roughnessFactor": 0.8,
         }
 
-        # Add PBR maps if available
+        # Add normal map if available (standard glTF 2.0 tangent-space normal)
         if normal_map_path and Path(normal_map_path).exists():
             pbr_kwargs["normalTexture"] = Image.open(normal_map_path)
             logger.info(f"  Normal map: {normal_map_path}")
-        if roughness_map_path and Path(roughness_map_path).exists():
-            pbr_kwargs["roughnessTexture"] = Image.open(roughness_map_path)
-            logger.info(f"  Roughness map: {roughness_map_path}")
-        if metallic_map_path and Path(metallic_map_path).exists():
-            pbr_kwargs["metallicTexture"] = Image.open(metallic_map_path)
-            logger.info(f"  Metallic map: {metallic_map_path}")
+
+        # Build combined ORM metallicRoughnessTexture per glTF 2.0 spec:
+        #   R = occlusion (255 = full, no AO), G = roughness, B = metallic
+        has_roughness = roughness_map_path and Path(roughness_map_path).exists()
+        has_metallic = metallic_map_path and Path(metallic_map_path).exists()
+        if has_roughness or has_metallic:
+            # Determine texture dimensions from whichever map is available
+            ref_img = Image.open(roughness_map_path) if has_roughness else Image.open(metallic_map_path)
+            tex_w, tex_h = ref_img.size
+
+            roughness_arr = np.array(ref_img.convert("L")) if has_roughness else np.full((tex_h, tex_w), 204, dtype=np.uint8)
+            if has_metallic:
+                metallic_img = Image.open(metallic_map_path).convert("L").resize((tex_w, tex_h), Image.LANCZOS)
+                metallic_arr = np.array(metallic_img)
+            else:
+                metallic_arr = np.zeros((tex_h, tex_w), dtype=np.uint8)
+
+            # ORM: R=occlusion(white=1.0), G=roughness, B=metallic
+            occlusion_arr = np.full((tex_h, tex_w), 255, dtype=np.uint8)
+            orm_array = np.stack([occlusion_arr, roughness_arr, metallic_arr], axis=-1)
+            orm_texture = Image.fromarray(orm_array, mode="RGB")
+
+            pbr_kwargs["metallicRoughnessTexture"] = orm_texture
+            pbr_kwargs["metallicFactor"] = 1.0
+            pbr_kwargs["roughnessFactor"] = 1.0
+            logger.info(f"  Combined ORM metallicRoughnessTexture: {tex_w}x{tex_h}")
+            if has_roughness:
+                logger.info(f"  Roughness map: {roughness_map_path}")
+            if has_metallic:
+                logger.info(f"  Metallic map: {metallic_map_path}")
 
         # Create PBR material
         material = trimesh.visual.material.PBRMaterial(**pbr_kwargs)
@@ -165,6 +189,43 @@ def export_textured_dir_to_glb(textured_dir: str, output_path: str) -> str:
         normal_map_path=normal_map,
         roughness_map_path=roughness_map,
         metallic_map_path=metallic_map,
+    )
+
+
+def export_hunyuan_paint_to_glb(textured_obj_dir: str, output_path: str, texture_paths: dict) -> str:
+    """Export Hunyuan3D Paint output to GLB with correct PBR materials.
+
+    Locates the OBJ and texture files produced by Hunyuan3D Paint in the given
+    directory and calls ``export_to_glb`` with the right PBR map paths.
+
+    Args:
+        textured_obj_dir: Directory containing Paint output (OBJ + textures).
+        output_path: Destination path for the final GLB file.
+        texture_paths: Dict returned by ``Hunyuan3DPaintWrapper.generate_textures()``
+            with keys: textured_obj, albedo, normal, roughness, metallic.
+
+    Returns:
+        Path to the exported GLB file.
+    """
+    obj_dir = Path(textured_obj_dir)
+
+    # Resolve OBJ mesh path
+    mesh_path = texture_paths.get("textured_obj")
+    if not mesh_path or not Path(mesh_path).exists():
+        # Fallback: scan directory for an OBJ
+        obj_files = list(obj_dir.rglob("*.obj"))
+        if not obj_files:
+            raise FileNotFoundError(f"No OBJ file found in {textured_obj_dir}")
+        mesh_path = str(obj_files[0])
+    logger.info(f"Exporting Paint output to GLB: mesh={mesh_path}")
+
+    return export_to_glb(
+        mesh_path=mesh_path,
+        texture_path=texture_paths.get("albedo"),
+        output_path=output_path,
+        normal_map_path=texture_paths.get("normal"),
+        roughness_map_path=texture_paths.get("roughness"),
+        metallic_map_path=texture_paths.get("metallic"),
     )
 
 

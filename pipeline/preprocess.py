@@ -148,6 +148,110 @@ def remove_background(img: Image.Image, use_gpu: bool = False) -> Image.Image:
         return img
 
 
+def correct_dynamic_range(
+    img: Image.Image,
+    low_percentile: float = 1.0,
+    high_percentile: float = 99.0,
+) -> Image.Image:
+    """Apply percentile-based dynamic range correction and adaptive gamma.
+
+    The correction is computed on the Y (luminance) channel of YCbCr space so
+    that colour hue and saturation are preserved.  When the image has an alpha
+    channel, only foreground pixels (alpha > 0) are used for statistics, but the
+    correction is applied to every pixel.
+
+    Steps:
+        1. Convert RGB to YCbCr via ``Y = 0.299*R + 0.587*G + 0.114*B``.
+        2. Percentile-stretch Y to use the full 0-255 range.
+        3. Apply adaptive gamma if mean Y is too dark (<70) or too bright (>200).
+        4. Convert back to RGB, preserving Cb/Cr.
+
+    Args:
+        img: Input PIL Image (RGB or RGBA).
+        low_percentile: Lower clipping percentile for stretch (default 1.0).
+        high_percentile: Upper clipping percentile for stretch (default 99.0).
+
+    Returns:
+        Corrected PIL Image in the same mode as the input.
+    """
+    original_mode = img.mode
+    alpha = None
+
+    if img.mode == "RGBA":
+        alpha = np.array(img.split()[3])
+        rgb = np.array(img.convert("RGB"), dtype=np.float64)
+        fg_mask = alpha > 0
+    elif img.mode == "RGB":
+        rgb = np.array(img, dtype=np.float64)
+        fg_mask = None
+    else:
+        rgb = np.array(img.convert("RGB"), dtype=np.float64)
+        fg_mask = None
+
+    # --- RGB -> YCbCr (ITU-R BT.601) ---
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    y = 0.299 * r + 0.587 * g + 0.114 * b
+    cb = -0.168736 * r - 0.331264 * g + 0.5 * b + 128.0
+    cr = 0.5 * r - 0.418688 * g - 0.081312 * b + 128.0
+
+    # --- Percentile stretch on Y (foreground only for stats) ---
+    if fg_mask is not None:
+        y_fg = y[fg_mask]
+    else:
+        y_fg = y.ravel()
+
+    if y_fg.size == 0:
+        logger.debug("correct_dynamic_range: no foreground pixels, skipping.")
+        return img
+
+    p_low = np.percentile(y_fg, low_percentile)
+    p_high = np.percentile(y_fg, high_percentile)
+
+    if p_high - p_low < 1.0:
+        logger.debug("correct_dynamic_range: near-constant luminance, skipping stretch.")
+    else:
+        y = np.clip((y - p_low) / (p_high - p_low) * 255.0, 0, 255)
+
+    # --- Adaptive gamma ---
+    if fg_mask is not None:
+        mean_y = np.mean(y[fg_mask])
+    else:
+        mean_y = np.mean(y)
+
+    if mean_y < 70 or mean_y > 200:
+        # Adaptive gamma: map mean luminance to mid-gray (128).
+        # Formula: gamma = log(0.5) / log(mean/255)
+        normalized_mean = np.clip(mean_y / 255.0, 1e-6, 1.0 - 1e-6)
+        gamma = np.log(0.5) / np.log(normalized_mean)
+        # Clamp to a safe range to avoid extreme corrections
+        gamma = float(np.clip(gamma, 0.3, 3.0))
+        logger.info(f"Dynamic range: mean Y={mean_y:.1f}, applying adaptive gamma={gamma:.3f}")
+        y = 255.0 * np.power(y / 255.0, gamma)
+    else:
+        logger.debug(f"Dynamic range: mean Y={mean_y:.1f}, gamma correction not needed.")
+
+    # --- YCbCr -> RGB ---
+    y_shifted = y - 0.0  # Y is already in 0-255
+    cb_shifted = cb - 128.0
+    cr_shifted = cr - 128.0
+
+    r_out = y_shifted + 1.402 * cr_shifted
+    g_out = y_shifted - 0.344136 * cb_shifted - 0.714136 * cr_shifted
+    b_out = y_shifted + 1.772 * cb_shifted
+
+    rgb_out = np.stack([r_out, g_out, b_out], axis=-1)
+    rgb_out = np.clip(rgb_out, 0, 255).astype(np.uint8)
+
+    result = Image.fromarray(rgb_out, mode="RGB")
+
+    # Restore alpha channel if the input had one
+    if original_mode == "RGBA" and alpha is not None:
+        result = result.convert("RGBA")
+        result.putalpha(Image.fromarray(alpha))
+
+    return result
+
+
 def resize_and_pad(img: Image.Image, target_size: int = 512) -> Image.Image:
     """
     Resize image to target_size x target_size, maintaining aspect ratio with padding.
@@ -186,6 +290,9 @@ def preprocess_image(
     target_size: int = 512,
     remove_bg: bool = True,
     use_gpu: bool = False,
+    correct_exposure: bool = False,
+    exposure_low_percentile: float = 1.0,
+    exposure_high_percentile: float = 99.0,
 ) -> Image.Image:
     """
     Full preprocessing pipeline for a single image.
@@ -195,6 +302,7 @@ def preprocess_image(
         2. Convert to RGB if RGBA (composite on white)
         3. Quality check (warn on low-res or blurry)
         4. Remove background using rembg
+        4b. (Optional) Dynamic range / exposure correction
         5. Resize to target_size x target_size (pad, don't stretch)
 
     Args:
@@ -202,9 +310,13 @@ def preprocess_image(
         target_size: Target dimension (default 512).
         remove_bg: Whether to remove background.
         use_gpu: Whether to use GPU for background removal.
+        correct_exposure: Apply dynamic range / exposure correction after
+            background removal (default False).
+        exposure_low_percentile: Low clipping percentile for dynamic range.
+        exposure_high_percentile: High clipping percentile for dynamic range.
 
     Returns:
-        Preprocessed PIL Image ready for Hi3DGen.
+        Preprocessed PIL Image ready for geometry generation.
     """
     # 1. Load
     img = load_image(image_path)
@@ -220,6 +332,15 @@ def preprocess_image(
     # 4. Background removal
     if remove_bg:
         img = remove_background(img, use_gpu=use_gpu)
+
+    # 4b. Dynamic range correction (after bg removal, before resize)
+    if correct_exposure:
+        logger.info("Applying dynamic range / exposure correction...")
+        img = correct_dynamic_range(
+            img,
+            low_percentile=exposure_low_percentile,
+            high_percentile=exposure_high_percentile,
+        )
 
     # 5. Resize and pad
     img = resize_and_pad(img, target_size=target_size)

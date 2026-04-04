@@ -1,9 +1,13 @@
 # Default configuration for 2D-to-3D Pipeline
 # Override via CLI arguments or by editing this file.
 
-# Pipeline backend: "hi3dgen" (two-stage) or "hunyuan3d" (single-stage with PBR)
+# Pipeline backend: default to Hunyuan3D-2.1 fp16 shape generation
 pipeline:
-  backend: "hi3dgen"           # "hi3dgen" = Hi3DGen + Text2Tex, "hunyuan3d" = Hunyuan3D-2.1
+  backend: "hunyuan3d"         # Default: Hunyuan3D-2.1 shape-only profile
+  hunyuan3d_model_path: "tencent/Hunyuan3D-2.1"  # Official fp16 shape model repo
+  skip_texturing: true         # Export geometry only (no texture stage)
+  game_ready: true             # Decimate Hunyuan meshes for game-ready export
+  game_ready_target_faces: 50000  # Target face count for game-ready output
 
 # Preprocessing
 preprocessing:
@@ -18,7 +22,7 @@ geometry:
   num_inference_steps: 50
   model_id: "Stable-X/trellis-normal-v0-1"
 
-# Texture Generation (Text2Tex / diffusers fallback)
+# Texture Generation (legacy Hi3DGen path only)
 texturing:
   seed: 42
   prompt: null               # Auto-generated from input image if null
@@ -37,16 +41,38 @@ mesh_repair:
 
 # PBR Map Generation
 pbr:
-  enabled: true                # Generate normal, roughness, metallic maps
+  enabled: false               # Shape-only default; not used by Hunyuan3D-2.1 profile
   normal_strength: 1.0         # Normal map intensity
   base_roughness: 0.7          # Base roughness value
 
 # Export
 export:
   format: "glb"              # Output format (glb = binary glTF 2.0)
-  embed_textures: true       # Embed textures in GLB file
+  embed_textures: false      # Shape-only default does not embed textures
   metallic_factor: 0.0       # PBR metallic factor
   roughness_factor: 0.8      # PBR roughness factor
+
+# Zero123++ multi-view generation (used by "full" backend)
+zero123:
+  num_inference_steps: 75
+  guidance_scale: 4.0
+
+# Dynamic range / exposure correction
+exposure:
+  enabled: false
+  low_percentile: 1.0
+  high_percentile: 99.0
+
+# Hunyuan3D-2mv shape generation
+shape_multiview:
+  octree_resolution: 384
+
+# Hunyuan3D Paint PBR texturing
+paint:
+  max_views: 6
+  resolution: 512
+  use_remesh: true
+  mmgp_profile: "LowRAM_LowVRAM"
 
 # Hardware
 device:

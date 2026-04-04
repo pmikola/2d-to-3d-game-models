@@ -149,3 +149,33 @@ def log_device_info(config: DeviceConfig) -> None:
             "Reduced viewpoints and DDIM steps to fit in available VRAM. "
             "Quality may be slightly lower than with 16+ GB VRAM."
         )
+
+
+def unload_gpu_model(model_attr_name: str, obj: object) -> None:
+    """Forcefully unload a model from GPU and free VRAM."""
+    model = getattr(obj, model_attr_name, None)
+    if model is not None:
+        if hasattr(model, 'to'):
+            try:
+                model.to('cpu')
+            except Exception:
+                pass
+        setattr(obj, model_attr_name, None)
+        del model
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        allocated = torch.cuda.memory_allocated() / (1024**3)
+        reserved = torch.cuda.memory_reserved() / (1024**3)
+        logger.info(f"GPU after unload [{model_attr_name}]: {allocated:.2f}GB alloc, {reserved:.2f}GB reserved")
+
+
+def log_vram_status(label: str = "") -> None:
+    """Log current VRAM usage."""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / (1024**3)
+        reserved = torch.cuda.memory_reserved() / (1024**3)
+        logger.info(f"VRAM [{label}]: {allocated:.2f}GB alloc / {reserved:.2f}GB reserved")
+    else:
+        logger.debug(f"VRAM [{label}]: No CUDA device")
