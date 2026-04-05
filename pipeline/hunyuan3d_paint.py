@@ -27,6 +27,7 @@ REALESRGAN_X4PLUS_URL = (
     "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/"
     "RealESRGAN_x4plus.pth"
 )
+WINDOWS_DLL_HANDLES = []
 
 
 class Hunyuan3DPaintWrapper:
@@ -83,6 +84,29 @@ class Hunyuan3DPaintWrapper:
             path_str = str(path)
             if path_str not in sys.path:
                 sys.path.insert(0, path_str)
+
+        if os.name == "nt" and hasattr(os, "add_dll_directory"):
+            dll_dirs = []
+            try:
+                import torch
+
+                torch_lib_dir = Path(torch.__file__).resolve().parent / "lib"
+                dll_dirs.append(torch_lib_dir)
+            except Exception:
+                pass
+
+            cuda_home = os.environ.get("CUDA_PATH") or os.environ.get("CUDA_HOME")
+            if cuda_home:
+                dll_dirs.append(Path(cuda_home) / "bin")
+
+            for dll_dir in dll_dirs:
+                if dll_dir.is_dir():
+                    try:
+                        WINDOWS_DLL_HANDLES.append(
+                            os.add_dll_directory(str(dll_dir))
+                        )
+                    except OSError:
+                        pass
 
         # ----------------------------------------------------------------
         # Eagerly claim the ``utils`` top-level package for hy3dpaint/utils
@@ -239,7 +263,15 @@ class Hunyuan3DPaintWrapper:
 
         if CUDA_HOME is not None:
             logger.info("Installing Hunyuan Paint custom rasterizer from %s", rasterizer_root)
-            cmd = [sys.executable, "-m", "pip", "install", "-e", str(rasterizer_root)]
+            cmd = [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "-e",
+                str(rasterizer_root),
+                "--no-build-isolation",
+            ]
             result = subprocess.run(
                 cmd,
                 stdout=subprocess.DEVNULL,
@@ -459,8 +491,33 @@ class Hunyuan3DPaintWrapper:
             from mmgp import offload, profile_type
 
             profile = getattr(profile_type, self.mmgp_profile, profile_type.LowRAM_LowVRAM)
-            offload.profile(self.pipeline, profile)
-            logger.info(f"MMGP offloading enabled ({self.mmgp_profile}).")
+            mv_model = None
+            models = getattr(self.pipeline, "models", None)
+            if isinstance(models, dict):
+                mv_model = models.get("multiview_model")
+
+            # MMGP cannot profile the custom Hunyuan3DPaintPipeline wrapper
+            # object directly. Follow the working logic from run_simple.py:
+            # profile the internal diffusion pipeline when exposed, otherwise
+            # profile the models dict itself.
+            if mv_model is not None and hasattr(mv_model, "pipeline"):
+                offload.profile(mv_model.pipeline, profile)
+                logger.info(
+                    "MMGP offloading enabled on Paint multiview pipeline (%s).",
+                    self.mmgp_profile,
+                )
+            elif isinstance(models, dict):
+                offload.profile(models, profile)
+                logger.info(
+                    "MMGP offloading enabled on Paint models dict (%s).",
+                    self.mmgp_profile,
+                )
+            else:
+                offload.profile(self.pipeline, profile)
+                logger.info(
+                    "MMGP offloading enabled on Paint wrapper (%s).",
+                    self.mmgp_profile,
+                )
         except Exception as exc:
             logger.warning(
                 "MMGP offloading unavailable (%s). Paint pipeline runs without "
@@ -561,32 +618,101 @@ class Hunyuan3DPaintWrapper:
             "metallic": None,
         }
 
+        def _apply_mtl_texture_hints(mtl_path: Path) -> None:
+            try:
+                lines = mtl_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+            except OSError:
+                return
+
+            for raw_line in lines:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split(maxsplit=1)
+                if len(parts) != 2:
+                    continue
+                key, value = parts
+                tex_path = mtl_path.parent / value.strip()
+                if not tex_path.exists():
+                    continue
+
+                tex_str = str(tex_path)
+                if key == "map_Kd" and result["albedo"] is None:
+                    result["albedo"] = tex_str
+                elif key in {"norm", "map_Bump", "bump"} and result["normal"] is None:
+                    result["normal"] = tex_str
+                elif key == "map_Pr" and result["roughness"] is None:
+                    result["roughness"] = tex_str
+                elif key == "map_Pm" and result["metallic"] is None:
+                    result["metallic"] = tex_str
+
+        textured_obj_path = Path(result["textured_obj"])
+        mtl_candidates = []
+        if textured_obj_path.suffix.lower() == ".obj":
+            mtl_candidates.append(textured_obj_path.with_suffix(".mtl"))
+        mtl_candidates.extend(sorted(output_path.rglob("*.mtl")))
+
+        seen_mtls = set()
+        for mtl_path in mtl_candidates:
+            key = str(mtl_path)
+            if key in seen_mtls or not mtl_path.exists():
+                continue
+            seen_mtls.add(key)
+            _apply_mtl_texture_hints(mtl_path)
+
         # Scan for texture files produced by Paint
         for f in output_path.rglob("*"):
             fname = f.stem.lower()
             if f.suffix.lower() in (".png", ".jpg", ".jpeg"):
-                if "albedo" in fname or "diffuse" in fname or "basecolor" in fname:
+                if fname == "reference":
+                    continue
+                if (
+                    result["albedo"] is None
+                    and (
+                        fname in {"textured", "texture"}
+                        or "albedo" in fname
+                        or "diffuse" in fname
+                        or "basecolor" in fname
+                    )
+                ):
                     result["albedo"] = str(f)
-                elif "normal" in fname:
+                elif result["normal"] is None and "normal" in fname:
                     result["normal"] = str(f)
-                elif "roughness" in fname:
+                elif result["roughness"] is None and "roughness" in fname:
                     result["roughness"] = str(f)
-                elif "metallic" in fname or "metalness" in fname:
+                elif (
+                    result["metallic"] is None
+                    and ("metallic" in fname or "metalness" in fname)
+                ):
                     result["metallic"] = str(f)
                 elif "mr" in fname or "metallicroughness" in fname:
                     # Combined metallic-roughness map
-                    result["roughness"] = str(f)
-                    result["metallic"] = str(f)
+                    if result["roughness"] is None:
+                        result["roughness"] = str(f)
+                    if result["metallic"] is None:
+                        result["metallic"] = str(f)
 
         # Fallback: if no individual albedo found, look for any texture image
         if result["albedo"] is None:
-            for pattern in ["texture_atlas.*", "*.png"]:
+            skip_tokens = (
+                "reference",
+                "normal",
+                "roughness",
+                "metallic",
+                "metalness",
+                "mr",
+                "metallicroughness",
+                "occlusion",
+                "ao",
+                "bump",
+            )
+            for pattern in ["textured.*", "texture_atlas.*", "*.png", "*.jpg", "*.jpeg"]:
                 matches = list(output_path.glob(pattern))
                 img_matches = [
                     m
                     for m in matches
                     if m.suffix.lower() in (".png", ".jpg")
-                    and "normal" not in m.stem.lower()
+                    and not any(token in m.stem.lower() for token in skip_tokens)
                 ]
                 if img_matches:
                     result["albedo"] = str(img_matches[0])

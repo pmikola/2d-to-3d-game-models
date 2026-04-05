@@ -7,7 +7,10 @@ pipeline:
   hunyuan3d_model_path: "tencent/Hunyuan3D-2.1"  # Official fp16 shape model repo
   skip_texturing: true         # Export geometry only (no texture stage)
   game_ready: true             # Decimate Hunyuan meshes for game-ready export
-  game_ready_target_faces: 50000  # Target face count for game-ready output
+  game_ready_target_faces: 120000  # Target face count — 120K preserves detail while staying game-ready
+  use_multiview: false         # false = single-view (more reliable), true = multi-view
+  multiview_generator: "mvadapter"  # "mvadapter", "charactergen", or "none"
+  chargen_path: null           # Path to cloned CharacterGen repo (only for "charactergen")
 
 # Preprocessing
 preprocessing:
@@ -37,7 +40,7 @@ texturing:
 # Mesh Repair (post-geometry, pre-texturing)
 mesh_repair:
   enabled: true
-  smooth_iterations: 3         # Taubin smoothing iterations (0 to skip)
+  smooth_iterations: 0         # 0 for stylized/low-poly art (preserves sharp edges)
   decimate_ratio: null         # Ratio of faces to keep (null = no decimation, 0.5 = 50%)
 
 # PBR Map Generation
@@ -68,7 +71,7 @@ exposure:
 
 # Hunyuan3D-2mv shape generation
 shape_multiview:
-  octree_resolution: 384
+  octree_resolution: 512  # 512 = 2.4x finer than 384, fits 16GB with num_chunks=20000
 
 # Hunyuan3D Paint PBR texturing
 paint:

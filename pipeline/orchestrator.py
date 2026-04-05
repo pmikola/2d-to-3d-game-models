@@ -69,6 +69,22 @@ class PipelineConfig:
     # PBR map generation
     generate_pbr: bool = False
 
+    # Multi-view mode for the "full" backend.
+    # False = single-view Hunyuan3D-2.1 (more reliable, avoids Janus problem).
+    # True  = MV-Adapter multi-view + Hunyuan3D-2mv (better when views are clean).
+    use_multiview: bool = True
+
+    # Which multi-view generator to use when use_multiview is True.
+    #   "mvadapter"    - MV-Adapter (ICCV 2025), 6 views at 768x768, ~14GB VRAM.
+    #   "charactergen" - CharacterGen 2D stage, 4 views at 512x768, ~8-10GB VRAM.
+    #                    Requires a CharacterGen clone (see pipeline/charactergen.py).
+    #   "none"         - Skip multi-view; use single-view Hunyuan3D-2.1.
+    multiview_generator: str = "mvadapter"
+
+    # Path to a cloned CharacterGen repository (only used when
+    # multiview_generator is "charactergen").
+    chargen_path: str | None = None
+
     # MV-Adapter multi-view generation (full backend)
     # 30 steps with ShiftSNR scheduler provides ~95% of the quality of 50
     # steps while cutting MV-Adapter runtime by ~40% (~18-36s savings).
@@ -190,16 +206,65 @@ class Pipeline:
         elif self.config.backend == "full":
             from .hunyuan3d import Hunyuan3DWrapper
             from .hunyuan3d_paint import Hunyuan3DPaintWrapper
-            from .zero123plus import MVAdapterWrapper
 
-            self._zero123 = MVAdapterWrapper(
-                device_config=self.device_config,
-            )
-            self._hunyuan3d = Hunyuan3DWrapper(
-                device_config=self.device_config,
-                model_path=self.config.hunyuan3d_model_path,
-                variant="multiview",
-            )
+            # Resolve the effective multi-view generator.  "none" overrides
+            # use_multiview to False for backward compatibility.
+            mv_gen = self.config.multiview_generator.lower()
+            if mv_gen == "none":
+                self.config.use_multiview = False
+
+            if self.config.use_multiview:
+                if mv_gen == "charactergen":
+                    from .charactergen import CharacterGenMVWrapper
+
+                    self._zero123 = CharacterGenMVWrapper(
+                        device_config=self.device_config,
+                        chargen_path=self.config.chargen_path,
+                    )
+                    logger.info("Using CharacterGen for multi-view generation.")
+                else:
+                    # Default: MV-Adapter
+                    from .zero123plus import MVAdapterWrapper
+
+                    self._zero123 = MVAdapterWrapper(
+                        device_config=self.device_config,
+                    )
+                    logger.info("Using MV-Adapter for multi-view generation.")
+
+                self._hunyuan3d = Hunyuan3DWrapper(
+                    device_config=self.device_config,
+                    model_path=self.config.hunyuan3d_model_path,
+                    variant="multiview",
+                )
+            else:
+                # Single-view mode: skip multi-view generator, use Hunyuan3D-2.1
+                self._hunyuan3d = Hunyuan3DWrapper(
+                    device_config=self.device_config,
+                    model_path=self.config.hunyuan3d_model_path,
+                    variant="single",
+                )
+
+            # Keep the Paint stage inside dedicated VRAM on 16 GB-class GPUs.
+            # Shared GPU memory works, but it is dramatically slower than real
+            # VRAM. Fewer paint views plus skipping Paint's internal remesh
+            # keeps the stage much more responsive on RTX 3080 Ti laptops.
+            if self.device_config.has_gpu and self.device_config.vram_gb < 18:
+                if self.config.paint_max_views > 4:
+                    logger.info(
+                        "Reducing Hunyuan3D Paint views from %d to 4 for %.1f GB VRAM.",
+                        self.config.paint_max_views,
+                        self.device_config.vram_gb,
+                    )
+                    self.config.paint_max_views = 4
+                if self.config.paint_use_remesh:
+                    logger.info(
+                        "Disabling Hunyuan3D Paint remesh on %.1f GB VRAM to "
+                        "avoid shared-memory spill. Stage 3 will UV-unwrap "
+                        "the mesh before texturing instead.",
+                        self.device_config.vram_gb,
+                    )
+                    self.config.paint_use_remesh = False
+
             self._hunyuan3d_paint = Hunyuan3DPaintWrapper(
                 device_config=self.device_config,
                 model_path=self.config.hunyuan3d_model_path,
@@ -231,26 +296,36 @@ class Pipeline:
             if self.config.mesh_repair:
                 logger.info(
                     "Disabling legacy mesh repair for the full backend to "
-                    "preserve Hunyuan3D-2mv geometry fidelity before UV/texturing."
+                    "preserve geometry fidelity before UV/texturing."
                 )
                 self.config.mesh_repair = False
 
-            if (
-                self.device_config.has_gpu
-                and self.device_config.vram_gb < 18
-                and self.config.zero123_steps > 35
-            ):
-                logger.info(
-                    "Reducing MV-Adapter steps from %d to 35 for stability on %.1f GB VRAM.",
-                    self.config.zero123_steps,
-                    self.device_config.vram_gb,
-                )
-                self.config.zero123_steps = 35
+            if self.config.use_multiview:
+                # MV-Adapter-specific VRAM guard (does not apply to CharacterGen).
+                if (
+                    mv_gen != "charactergen"
+                    and self.device_config.has_gpu
+                    and self.device_config.vram_gb < 18
+                    and self.config.zero123_steps > 35
+                ):
+                    logger.info(
+                        "Reducing MV-Adapter steps from %d to 35 for stability on %.1f GB VRAM.",
+                        self.config.zero123_steps,
+                        self.device_config.vram_gb,
+                    )
+                    self.config.zero123_steps = 35
 
-            logger.info(
-                "Full 5-stage pipeline selected: MV-Adapter -> Hunyuan3D-2mv -> "
-                "mesh repair -> Hunyuan3D Paint -> PBR GLB export."
-            )
+                mv_label = "CharacterGen" if mv_gen == "charactergen" else "MV-Adapter"
+                logger.info(
+                    "Full 5-stage pipeline selected (multi-view): %s -> "
+                    "Hunyuan3D-2mv -> mesh repair -> Hunyuan3D Paint -> PBR GLB export.",
+                    mv_label,
+                )
+            else:
+                logger.info(
+                    "Full pipeline selected (single-view): Hunyuan3D-2.1 -> "
+                    "mesh repair -> Hunyuan3D Paint -> PBR GLB export."
+                )
 
         elif self.config.backend == "triposg":
             from .triposg import TripoSGWrapper
@@ -371,66 +446,95 @@ class Pipeline:
                     logger.info("[Stage 2/2] Exporting geometry-only GLB...")
                     export_to_glb(obj_path, None, output_path)
 
-            # --- Full 5-stage backend ---
-            elif self.config.backend == "full" and self._zero123 is not None:
-                # Stage 1: Multi-view generation (MV-Adapter ~14GB)
-                # MV-Adapter wants RGBA (it composites on gray internally)
-                logger.info("[Stage 1/5] Generating multi-view images (MV-Adapter)...")
-                mv_view_names = ["front", "left", "back", "right"]
-                mv_batch_size = 2 if self.device_config.has_gpu and self.device_config.vram_gb < 18 else None
-                try:
-                    views = self._zero123.generate_views(
-                        preprocessed_rgba,
-                        num_inference_steps=self.config.zero123_steps,
-                        guidance_scale=self.config.zero123_guidance_scale,
-                        requested_view_names=mv_view_names,
-                        batch_size=mv_batch_size,
-                    )
-                finally:
-                    self._zero123.unload()
-                    release_runtime_memory("after_mvadapter_stage")
+            # --- Full backend (multi-view or single-view) ---
+            elif self.config.backend == "full" and self._hunyuan3d is not None:
+                if self.config.use_multiview and self._zero123 is not None:
+                    # Stage 1: Multi-view generation
+                    mv_gen = self.config.multiview_generator.lower()
+                    mv_label = "CharacterGen" if mv_gen == "charactergen" else "MV-Adapter"
+                    logger.info("[Stage 1/5] Generating multi-view images (%s)...", mv_label)
+                    mv_view_names = ["front", "left", "back", "right"]
+                    mv_batch_size = 2 if self.device_config.has_gpu and self.device_config.vram_gb < 18 else None
+                    try:
+                        views = self._zero123.generate_views(
+                            preprocessed_rgba,
+                            num_inference_steps=self.config.zero123_steps,
+                            guidance_scale=self.config.zero123_guidance_scale,
+                            requested_view_names=mv_view_names,
+                            batch_size=mv_batch_size,
+                        )
+                    finally:
+                        self._zero123.unload()
+                        release_runtime_memory("after_multiview_stage")
 
-                # Save multi-view debug images — include azimuth in filename so
-                # it is easy to diagnose which azimuth produces which view.
-                _name_to_az = {
-                    name: az for _idx, (name, az) in self._zero123.AZIMUTH_MAP.items()
-                }
-                for view_name, view_img in views.items():
-                    az_deg = _name_to_az.get(view_name, "?")
-                    view_path = output_dir / f"{Path(input_path).stem}_view_{view_name}_az{az_deg}.png"
-                    view_img.save(str(view_path))
-                logger.info(f"Saved {len(views)} multi-view images for debugging.")
+                    # Save multi-view debug images.  MV-Adapter has an
+                    # AZIMUTH_MAP with azimuth degrees; CharacterGen does not,
+                    # so we fall back to view name only.
+                    _name_to_az = {}
+                    if hasattr(self._zero123, "AZIMUTH_MAP"):
+                        _name_to_az = {
+                            name: az for _idx, (name, az) in self._zero123.AZIMUTH_MAP.items()
+                        }
+                    for view_name, view_img in views.items():
+                        az_deg = _name_to_az.get(view_name)
+                        suffix = f"_az{az_deg}" if az_deg is not None else ""
+                        view_path = output_dir / f"{Path(input_path).stem}_view_{view_name}{suffix}.png"
+                        view_img.save(str(view_path))
+                    logger.info(f"Saved {len(views)} multi-view images for debugging.")
 
-                # Remove gray background from MV-Adapter views before Hunyuan3D-2mv.
-                # MV-Adapter outputs RGB on gray (128) bg; Hunyuan3D-2mv's
-                # MVImageProcessorV2 expects RGBA with meaningful alpha.
-                cardinal_views = {}
-                for name in ("front", "left", "back", "right"):
-                    if name in views:
-                        cardinal_views[name] = remove_gray_background(views[name])
-                del views
-                release_runtime_memory("after_multiview_output_cleanup")
+                    # Remove gray background from multi-view outputs before
+                    # Hunyuan3D-2mv.  Both MV-Adapter and CharacterGen output
+                    # RGB on gray backgrounds; Hunyuan3D-2mv's
+                    # MVImageProcessorV2 expects RGBA with meaningful alpha.
+                    cardinal_views = {}
+                    for name in ("front", "left", "back", "right"):
+                        if name in views:
+                            cardinal_views[name] = remove_gray_background(views[name])
+                    del views
+                    release_runtime_memory("after_multiview_output_cleanup")
 
-                # Stage 2: Shape generation (Hunyuan3D-2mv ~10GB)
-                logger.info("[Stage 2/5] Generating 3D shape (Hunyuan3D-2mv)...")
-                try:
-                    self._hunyuan3d.load()
-                    hy_result = self._hunyuan3d.generate_from_multiview(
-                        views=cardinal_views,
-                        seed=self.config.geometry_seed,
-                        guidance_scale=self.config.geometry_guidance_scale,
-                        num_steps=self.config.geometry_steps,
-                        octree_resolution=self.config.shape_octree_resolution,
-                    )
-                    mesh = hy_result["mesh"]
-                    result.mesh_vertices = len(mesh.vertices)
-                    result.mesh_faces = len(mesh.faces)
-                finally:
-                    self._hunyuan3d.unload()
-                    release_runtime_memory("after_hunyuan_multiview_stage")
-                del hy_result
-                del cardinal_views
-                release_runtime_memory("after_shape_output_cleanup")
+                    # Stage 2: Shape generation (Hunyuan3D-2mv ~10GB)
+                    logger.info("[Stage 2/5] Generating 3D shape (Hunyuan3D-2mv)...")
+                    try:
+                        self._hunyuan3d.load()
+                        hy_result = self._hunyuan3d.generate_from_multiview(
+                            views=cardinal_views,
+                            seed=self.config.geometry_seed,
+                            guidance_scale=self.config.geometry_guidance_scale,
+                            num_steps=self.config.geometry_steps,
+                            octree_resolution=self.config.shape_octree_resolution,
+                        )
+                        mesh = hy_result["mesh"]
+                        result.mesh_vertices = len(mesh.vertices)
+                        result.mesh_faces = len(mesh.faces)
+                    finally:
+                        self._hunyuan3d.unload()
+                        release_runtime_memory("after_hunyuan_multiview_stage")
+                    del hy_result
+                    del cardinal_views
+                    release_runtime_memory("after_shape_output_cleanup")
+                else:
+                    # Single-view mode: skip MV-Adapter, use Hunyuan3D-2.1 directly
+                    logger.info("[Stage 1/5] Skipped (single-view mode, no MV-Adapter).")
+                    # Hunyuan3D-2.1 single-view expects RGB on white background
+                    preprocessed_white = composite_on_background(preprocessed_rgba, (255, 255, 255))
+                    logger.info("[Stage 2/5] Generating 3D shape (Hunyuan3D-2.1 single-view)...")
+                    try:
+                        self._hunyuan3d.load()
+                        hy_result = self._hunyuan3d.generate(
+                            image=preprocessed_white,
+                            seed=self.config.geometry_seed,
+                            guidance_scale=self.config.geometry_guidance_scale,
+                            num_steps=self.config.geometry_steps,
+                        )
+                        mesh = hy_result["mesh"]
+                        result.mesh_vertices = len(mesh.vertices)
+                        result.mesh_faces = len(mesh.faces)
+                    finally:
+                        self._hunyuan3d.unload()
+                        release_runtime_memory("after_hunyuan_single_stage")
+                    del hy_result
+                    release_runtime_memory("after_shape_output_cleanup")
 
                 # Stage 3: Mesh prep — normalize and ALWAYS decimate.
                 #

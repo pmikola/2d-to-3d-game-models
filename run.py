@@ -83,6 +83,10 @@ def load_config_from_yaml(yaml_path: str) -> PipelineConfig:
         game_ready=pipeline_cfg.get("game_ready", True),
         game_ready_target_faces=pipeline_cfg.get("game_ready_target_faces", 50000),
         force_cpu=device.get("force_cpu", False),
+        # Multi-view toggle (full backend)
+        use_multiview=pipeline_cfg.get("use_multiview", True),
+        multiview_generator=pipeline_cfg.get("multiview_generator", "mvadapter"),
+        chargen_path=pipeline_cfg.get("chargen_path", None),
         # MV-Adapter multi-view
         zero123_steps=zero123.get("num_inference_steps", 50),
         zero123_guidance_scale=zero123.get("guidance_scale", 4.0),
@@ -232,6 +236,38 @@ Examples:
 
     # Full pipeline options
     parser.add_argument(
+        "--multiview",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Full backend: use MV-Adapter multi-view pipeline "
+            "(use --no-multiview for single-view Hunyuan3D-2.1, "
+            "which avoids the Janus problem on difficult characters)"
+        ),
+    )
+    parser.add_argument(
+        "--multiview-generator",
+        type=str,
+        choices=["mvadapter", "charactergen", "none"],
+        default=None,
+        help=(
+            "Full backend: which multi-view generator to use. "
+            "'mvadapter' (default) uses MV-Adapter (768x768, ~14GB VRAM); "
+            "'charactergen' uses CharacterGen 2D stage (512x768, ~8-10GB VRAM, "
+            "requires a cloned CharacterGen repo); "
+            "'none' disables multi-view and uses single-view Hunyuan3D-2.1"
+        ),
+    )
+    parser.add_argument(
+        "--chargen-path",
+        type=str,
+        default=None,
+        help=(
+            "Path to a cloned CharacterGen repository "
+            "(only used when --multiview-generator=charactergen)"
+        ),
+    )
+    parser.add_argument(
         "--correct-exposure",
         action="store_true",
         help="Apply dynamic range / exposure correction during preprocessing",
@@ -354,6 +390,18 @@ def main() -> int:
         config.text2tex_path = args.text2tex_path
 
     # Full pipeline overrides
+    if _cli_arg_was_provided("--multiview") or _cli_arg_was_provided("--no-multiview"):
+        config.use_multiview = args.multiview
+    if _cli_arg_was_provided("--multiview-generator"):
+        config.multiview_generator = args.multiview_generator
+        # "none" implicitly disables multi-view.
+        if args.multiview_generator == "none":
+            config.use_multiview = False
+        elif not _cli_arg_was_provided("--no-multiview"):
+            # Selecting a generator implies multi-view should be enabled.
+            config.use_multiview = True
+    if _cli_arg_was_provided("--chargen-path"):
+        config.chargen_path = args.chargen_path
     if args.correct_exposure:
         config.correct_exposure = True
     if _cli_arg_was_provided("--paint-resolution"):
