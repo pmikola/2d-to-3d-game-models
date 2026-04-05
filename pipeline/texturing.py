@@ -58,22 +58,86 @@ class TextureGenerator:
             self._load_sd_pipeline()
             self._initialized = True
             logger.info("Texture pipeline initialized successfully.")
+        except RuntimeError as e:
+            # Already has actionable guidance from _load_sd_pipeline
+            logger.error(f"Texture pipeline initialization failed:\n{e}")
+            raise
         except Exception as e:
-            logger.error(f"Failed to initialize texture pipeline: {e}")
+            logger.error(
+                f"Unexpected error initializing texture pipeline: {e}\n"
+                "Ensure `diffusers`, `transformers`, and `torch` are installed, "
+                "and that you have network access to huggingface.co."
+            )
             raise
 
+    # Primary model and fallback mirrors for depth-conditioned SD2.
+    # The official repo is public but can fail if a stale/invalid HF token
+    # is cached locally, so we also try the community mirror.
+    _DEPTH_MODEL_IDS = [
+        "stabilityai/stable-diffusion-2-depth",       # official
+        "sd2-community/stable-diffusion-2-depth",      # community mirror
+    ]
+
     def _load_sd_pipeline(self) -> None:
-        """Load Stable Diffusion 2 depth pipeline."""
+        """Load Stable Diffusion 2 depth pipeline.
+
+        Tries the official model first (without auth, then with), and
+        falls back to a community mirror if the official repo is
+        unreachable.
+        """
+        import os
+
         import torch
         from diffusers import StableDiffusionDepth2ImgPipeline
 
-        model_id = "stabilityai/stable-diffusion-2-depth"
-        logger.info(f"Loading {model_id}...")
+        last_error: Exception | None = None
 
-        pipe = StableDiffusionDepth2ImgPipeline.from_pretrained(
-            model_id,
-            torch_dtype=self.device_config.dtype,
-        )
+        for model_id in self._DEPTH_MODEL_IDS:
+            # Attempt 1 – no explicit token (works for public repos when
+            # there is no stale token cached)
+            try:
+                logger.info(f"Loading depth model {model_id} (no explicit auth)...")
+                pipe = StableDiffusionDepth2ImgPipeline.from_pretrained(
+                    model_id,
+                    torch_dtype=self.device_config.dtype,
+                )
+                break  # success
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"Could not load {model_id} without auth: {e}"
+                )
+
+            # Attempt 2 – with HF token (handles gated repos or
+            # environments where a token is required)
+            hf_token = os.environ.get("HF_TOKEN") or True  # True = use cached login
+            try:
+                logger.info(f"Retrying {model_id} with HuggingFace auth token...")
+                pipe = StableDiffusionDepth2ImgPipeline.from_pretrained(
+                    model_id,
+                    torch_dtype=self.device_config.dtype,
+                    token=hf_token,
+                )
+                break  # success
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"Could not load {model_id} with auth token: {e}"
+                )
+        else:
+            # All candidates exhausted
+            raise RuntimeError(
+                "Failed to load any depth-conditioned Stable Diffusion model. "
+                f"Tried: {', '.join(self._DEPTH_MODEL_IDS)}.\n"
+                "Possible fixes:\n"
+                "  1. Run `huggingface-cli login` to cache a valid token.\n"
+                "  2. Set the HF_TOKEN environment variable.\n"
+                "  3. If you have a local copy of the model, pass its path "
+                "via the texturing.model_id config key.\n"
+                f"Last error: {last_error}"
+            )
+
+        logger.info(f"Successfully loaded depth model: {model_id}")
 
         if self.device_config.has_gpu:
             pipe = pipe.to(self.device_config.device)
@@ -381,6 +445,9 @@ class TextureGenerator:
         Uses trimesh's built-in rendering or pyrender if available.
         """
         try:
+            from .deps import ensure_package
+
+            ensure_package("pyrender", pip_spec="pyrender>=0.1.45")
             import pyrender
 
             # Create scene
@@ -420,8 +487,11 @@ class TextureGenerator:
             depth_uint8 = (depth_normalized * 255).astype(np.uint8)
             return Image.fromarray(depth_uint8)
 
-        except ImportError:
-            logger.debug("pyrender not available, generating synthetic depth map.")
+        except Exception as exc:
+            logger.debug(
+                "pyrender unavailable for depth rendering (%s); generating synthetic depth map.",
+                exc,
+            )
             # Generate a simple synthetic depth map as placeholder
             depth = np.zeros((resolution, resolution), dtype=np.uint8)
             center = resolution // 2
@@ -430,10 +500,6 @@ class TextureGenerator:
             mask = x * x + y * y <= radius * radius
             depth[mask] = 200
             return Image.fromarray(depth)
-
-        except Exception as e:
-            logger.warning(f"Depth rendering failed: {e}")
-            return None
 
     @staticmethod
     def _look_at(eye, target, up):

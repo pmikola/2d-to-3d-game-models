@@ -13,6 +13,10 @@ from PIL import Image, ImageFilter
 
 logger = logging.getLogger(__name__)
 
+# Cached rembg session to avoid reloading the model on every call.
+# Keys: model name (str), values: rembg session object.
+_rembg_session_cache: dict = {}
+
 # Supported input formats
 SUPPORTED_FORMATS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif"}
 
@@ -110,33 +114,73 @@ def check_image_quality(img: Image.Image) -> list[str]:
     return warnings
 
 
-def remove_background(img: Image.Image, use_gpu: bool = False) -> Image.Image:
+def remove_background(
+    img: Image.Image,
+    use_gpu: bool = False,
+    bg_model: str = "birefnet-general",
+) -> Image.Image:
     """
     Remove background from image using rembg.
 
     Hi3DGen works best with isolated objects on clean backgrounds.
+    By default uses the BiRefNet model (birefnet-general) which provides
+    significantly better segmentation accuracy than the legacy U2Net default.
+    Falls back to the default rembg model if the requested session cannot
+    be created.
 
     Args:
         img: Input PIL Image in RGB mode.
         use_gpu: Whether to use GPU acceleration for background removal.
+        bg_model: rembg session/model name (default ``"birefnet-general"``).
+            Other useful values: ``"birefnet-general-lite"``,
+            ``"birefnet-massive"``, ``"u2net"`` (legacy default).
 
     Returns:
-        PIL Image with background removed (composited on white).
+        PIL Image in RGBA mode with background removed (alpha channel
+        encodes the foreground mask).
     """
     try:
-        from rembg import remove
+        from .deps import ensure_package
 
-        logger.info("Removing background with rembg...")
+        ensure_package("rembg", pip_spec="rembg>=2.0.57")
+        from rembg import new_session, remove
+
+        # Reuse a cached session to avoid reloading the ONNX model on every
+        # call.  BiRefNet model load can take 2-5 seconds, so caching the
+        # session across images saves significant time in batch runs and
+        # repeated single-image calls.
+        session = _rembg_session_cache.get(bg_model)
+        if session is None:
+            try:
+                session = new_session(bg_model)
+                _rembg_session_cache[bg_model] = session
+                logger.info(
+                    "Created and cached rembg session (model=%s).", bg_model
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"Failed to create rembg session '{bg_model}': {exc}. "
+                    "Falling back to default rembg model (u2net)."
+                )
+                session = None
+        else:
+            logger.info(
+                "Reusing cached rembg session (model=%s).", bg_model
+            )
+
         # rembg returns RGBA image
-        result = remove(img)
+        if session is not None:
+            result = remove(img, session=session)
+        else:
+            logger.info("Removing background with rembg (default model)...")
+            result = remove(img)
 
-        # Composite onto white background
-        if result.mode == "RGBA":
-            background = Image.new("RGB", result.size, (255, 255, 255))
-            background.paste(result, mask=result.split()[3])
-            result = background
+        # Preserve the RGBA output directly — downstream consumers composite
+        # onto their required background color at point of use.
+        if result.mode != "RGBA":
+            result = result.convert("RGBA")
 
-        logger.info("Background removal complete.")
+        logger.info("Background removal complete (returning RGBA).")
         return result
 
     except ImportError:
@@ -145,6 +189,9 @@ def remove_background(img: Image.Image, use_gpu: bool = False) -> Image.Image:
             "Install with: pip install rembg[gpu] (GPU) or pip install rembg (CPU). "
             "Background removal significantly improves 3D reconstruction quality."
         )
+        # Return RGBA with full opacity so downstream code always gets RGBA
+        if img.mode != "RGBA":
+            return img.convert("RGBA")
         return img
 
 
@@ -275,11 +322,19 @@ def resize_and_pad(img: Image.Image, target_size: int = 512) -> Image.Image:
     # Resize with high-quality resampling
     resized = img.resize((new_w, new_h), Image.LANCZOS)
 
-    # Pad to target_size x target_size (center the image on white background)
-    padded = Image.new("RGB", (target_size, target_size), (255, 255, 255))
-    offset_x = (target_size - new_w) // 2
-    offset_y = (target_size - new_h) // 2
-    padded.paste(resized, (offset_x, offset_y))
+    # Pad to target_size x target_size.
+    # Preserve RGBA if the input has an alpha channel (transparent padding);
+    # otherwise use white padding for RGB images.
+    if img.mode == "RGBA":
+        padded = Image.new("RGBA", (target_size, target_size), (0, 0, 0, 0))
+        offset_x = (target_size - new_w) // 2
+        offset_y = (target_size - new_h) // 2
+        padded.paste(resized, (offset_x, offset_y))
+    else:
+        padded = Image.new("RGB", (target_size, target_size), (255, 255, 255))
+        offset_x = (target_size - new_w) // 2
+        offset_y = (target_size - new_h) // 2
+        padded.paste(resized, (offset_x, offset_y))
 
     logger.info(f"Resized {w}x{h} -> {new_w}x{new_h}, padded to {target_size}x{target_size}.")
     return padded
@@ -293,6 +348,7 @@ def preprocess_image(
     correct_exposure: bool = False,
     exposure_low_percentile: float = 1.0,
     exposure_high_percentile: float = 99.0,
+    bg_model: str = "birefnet-general",
 ) -> Image.Image:
     """
     Full preprocessing pipeline for a single image.
@@ -314,26 +370,37 @@ def preprocess_image(
             background removal (default False).
         exposure_low_percentile: Low clipping percentile for dynamic range.
         exposure_high_percentile: High clipping percentile for dynamic range.
+        bg_model: rembg session/model name for background removal
+            (default ``"birefnet-general"``).  Pass ``"u2net"`` for the
+            legacy model.
 
     Returns:
-        Preprocessed PIL Image ready for geometry generation.
+        Preprocessed PIL Image in RGBA mode (alpha from rembg preserved)
+        ready for geometry generation.  Downstream consumers should
+        composite onto their required background color at point of use
+        via :func:`composite_on_background`.
     """
-    # 1. Load
+    # 1. Load (keep original mode — don't flatten alpha before bg removal)
     img = load_image(image_path)
 
-    # 2. Convert to RGB
-    img = convert_to_rgb(img)
-
-    # 3. Quality check
+    # 2. Quality check (works on any mode)
     warnings = check_image_quality(img)
     for warning in warnings:
         logger.warning(warning)
 
-    # 4. Background removal
+    # 3. Background removal — returns RGBA with alpha mask
     if remove_bg:
-        img = remove_background(img, use_gpu=use_gpu)
+        # rembg expects RGB input; convert but don't flatten existing alpha yet
+        img = remove_background(
+            img.convert("RGB"), use_gpu=use_gpu, bg_model=bg_model
+        )
+    else:
+        # No bg removal requested — ensure RGBA with full opacity
+        if img.mode != "RGBA":
+            img = img.convert("RGBA")
 
-    # 4b. Dynamic range correction (after bg removal, before resize)
+    # 4. Dynamic range correction (after bg removal, before resize)
+    # Works on RGBA: uses alpha mask for foreground-only statistics
     if correct_exposure:
         logger.info("Applying dynamic range / exposure correction...")
         img = correct_dynamic_range(
@@ -342,7 +409,52 @@ def preprocess_image(
             high_percentile=exposure_high_percentile,
         )
 
-    # 5. Resize and pad
+    # 5. Resize and pad (preserves RGBA with transparent padding)
     img = resize_and_pad(img, target_size=target_size)
 
     return img
+
+
+def composite_on_background(
+    img: Image.Image, bg_color: tuple = (255, 255, 255)
+) -> Image.Image:
+    """Composite an RGBA image onto a solid background color, returning RGB.
+
+    Args:
+        img: Input PIL Image (RGB or RGBA).
+        bg_color: Background color as an (R, G, B) tuple (default white).
+
+    Returns:
+        PIL Image in RGB mode.
+    """
+    if img.mode != "RGBA":
+        return img.convert("RGB")
+    background = Image.new("RGB", img.size, bg_color)
+    background.paste(img, mask=img.split()[3])
+    return background
+
+
+def remove_gray_background(
+    img: Image.Image, gray_value: int = 128, tolerance: int = 30
+) -> Image.Image:
+    """Remove uniform gray background from MV-Adapter output, returning RGBA.
+
+    MV-Adapter composites its views onto a mid-gray (128, 128, 128) canvas.
+    This helper creates an alpha channel that marks those gray pixels as
+    transparent so that Hunyuan3D-2mv's MVImageProcessorV2 receives proper
+    RGBA input.
+
+    Args:
+        img: Input PIL Image (RGB expected from MV-Adapter output).
+        gray_value: Central gray value to treat as background (default 128).
+        tolerance: Per-channel tolerance around *gray_value* (default 30).
+
+    Returns:
+        PIL Image in RGBA mode with gray background made transparent.
+    """
+    arr = np.array(img.convert("RGB"))
+    # Gray background: all channels within tolerance of gray_value
+    is_bg = np.all(np.abs(arr.astype(int) - gray_value) < tolerance, axis=-1)
+    alpha = np.where(is_bg, 0, 255).astype(np.uint8)
+    rgba = np.dstack([arr, alpha])
+    return Image.fromarray(rgba, mode="RGBA")

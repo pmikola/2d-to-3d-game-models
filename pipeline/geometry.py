@@ -247,24 +247,31 @@ def unwrap_uvs(mesh) -> None:
     Text2Tex/TEXTure require UV-mapped meshes. Hi3DGen output typically
     does not include UV coordinates, so we generate them here.
 
+    Uses ``xatlas.parametrize()`` (the direct C++ path) which is faster
+    than the ``Atlas.generate()`` wrapper for single meshes.
+
     Args:
         mesh: trimesh.Trimesh object (modified in-place).
     """
+    import time
+
     try:
         import xatlas
 
-        logger.info("UV unwrapping mesh with xatlas...")
+        num_faces = len(mesh.faces)
+        logger.info(
+            "UV unwrapping mesh with xatlas (%d faces)...", num_faces
+        )
 
-        vertices = np.array(mesh.vertices, dtype=np.float32)
-        faces = np.array(mesh.faces, dtype=np.uint32)
+        # Contiguous arrays are required by the C++ bindings.
+        vertices = np.ascontiguousarray(mesh.vertices, dtype=np.float32)
+        faces = np.ascontiguousarray(mesh.faces, dtype=np.uint32)
 
-        # Run xatlas UV unwrapping
-        atlas = xatlas.Atlas()
-        atlas.add_mesh(vertices, faces)
-        atlas.generate()
-
-        # Get the unwrapped mesh data
-        vmapping, new_faces, uvs = atlas[0]
+        # xatlas.parametrize() is the fastest single-mesh path — it calls
+        # the C++ implementation directly without the Python Atlas overhead.
+        t0 = time.time()
+        vmapping, new_faces, uvs = xatlas.parametrize(vertices, faces)
+        elapsed = time.time() - t0
 
         # Update mesh with UV data
         mesh.vertices = vertices[vmapping]
@@ -279,8 +286,9 @@ def unwrap_uvs(mesh) -> None:
             mesh.visual = mesh.visual.__class__(uv=uvs, material=None)
 
         logger.info(
-            f"UV unwrapping complete. "
-            f"Vertices: {len(mesh.vertices)}, UVs: {len(uvs)}"
+            "UV unwrapping complete in %.1fs. "
+            "Vertices: %d -> %d, UVs: %d",
+            elapsed, len(vertices), len(mesh.vertices), len(uvs),
         )
 
     except ImportError:

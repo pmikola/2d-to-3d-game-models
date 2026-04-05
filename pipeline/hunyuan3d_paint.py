@@ -10,13 +10,23 @@ VRAM: ~14 GB peak with MMGP ``LowRAM_LowVRAM`` on a 32 GB RAM system.
 """
 
 import logging
+import importlib
+import os
+import subprocess
 import sys
 from pathlib import Path
+import types
+from urllib.request import urlretrieve
 
 import numpy as np
 from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+REALESRGAN_X4PLUS_URL = (
+    "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/"
+    "RealESRGAN_x4plus.pth"
+)
 
 
 class Hunyuan3DPaintWrapper:
@@ -48,6 +58,257 @@ class Hunyuan3DPaintWrapper:
                 return str(root)
         return None
 
+    @staticmethod
+    def _prepare_paint_imports(code_root: Path) -> None:
+        """
+        Match Tencent's expected import layout for Paint.
+
+        `textureGenPipeline.py` imports sibling modules like
+        `DifferentiableRenderer` and `utils` as top-level packages, so
+        `hy3dpaint` itself must be on `sys.path`. The custom rasterizer package
+        also lives one level deeper.
+        """
+        paint_root = code_root / "hy3dpaint"
+        rasterizer_root = paint_root / "custom_rasterizer"
+
+        for path in (code_root, paint_root, rasterizer_root):
+            path_str = str(path)
+            if path_str not in sys.path:
+                sys.path.insert(0, path_str)
+
+        # Hunyuan Paint imports `bpy` only for its optional OBJ->GLB helper.
+        # This project performs final GLB export itself, so a lightweight stub
+        # keeps the import path working on systems without Blender Python.
+        try:
+            import bpy  # noqa: F401
+        except ModuleNotFoundError:
+            sys.modules.setdefault("bpy", types.ModuleType("bpy"))
+
+        # The C++ UV inpaint helper is an optional quality improvement. If it
+        # is unavailable we keep the pipeline usable by skipping the mesh-aware
+        # prefill step and letting the later OpenCV inpaint handle holes.
+        try:
+            importlib.import_module("DifferentiableRenderer.mesh_inpaint_processor")
+        except ModuleNotFoundError:
+            fallback_mod = types.ModuleType("DifferentiableRenderer.mesh_inpaint_processor")
+
+            def meshVerticeInpaint(texture, mask, vtx_pos, vtx_uv, pos_idx, uv_idx):
+                return texture, mask
+
+            fallback_mod.meshVerticeInpaint = meshVerticeInpaint
+            sys.modules["DifferentiableRenderer.mesh_inpaint_processor"] = fallback_mod
+            logger.warning(
+                "mesh_inpaint_processor extension unavailable; using simplified UV "
+                "inpaint fallback."
+            )
+
+    @staticmethod
+    def _ensure_realesrgan_weights(code_root: Path) -> Path:
+        """Download the RealESRGAN checkpoint on first use."""
+        weight_path = code_root / "hy3dpaint" / "ckpt" / "RealESRGAN_x4plus.pth"
+        if weight_path.exists():
+            return weight_path
+
+        weight_path.parent.mkdir(parents=True, exist_ok=True)
+        logger.info("Downloading RealESRGAN weights to %s", weight_path)
+        urlretrieve(REALESRGAN_X4PLUS_URL, weight_path)
+        logger.info("RealESRGAN weights downloaded successfully.")
+        return weight_path
+
+    @staticmethod
+    def _summarize_output(output: str, max_lines: int = 20) -> str:
+        lines = [line.rstrip() for line in output.splitlines() if line.strip()]
+        return "\n".join(lines[-max_lines:])
+
+    def _ensure_custom_rasterizer(self, code_root: Path) -> None:
+        """
+        Ensure Hunyuan Paint's CUDA rasterizer package is importable.
+
+        Tries, in order:
+        1. Import the pre-compiled ``custom_rasterizer`` package.
+        2. Compile it from source (requires CUDA toolkit + C++ compiler).
+        3. Register a pure-PyTorch fallback that is slower but requires no
+           compilation.  The fallback implements the same ``rasterize_image``
+           function as the C++ kernel and produces identical output.
+        """
+        try:
+            import custom_rasterizer  # noqa: F401
+            return
+        except (ModuleNotFoundError, ImportError):
+            pass
+
+        # ----------------------------------------------------------
+        # Attempt compilation
+        # ----------------------------------------------------------
+        compiled = False
+        try:
+            from torch.utils.cpp_extension import CUDA_HOME
+        except ImportError:
+            CUDA_HOME = None
+
+        rasterizer_root = code_root / "hy3dpaint" / "custom_rasterizer"
+
+        if CUDA_HOME is not None:
+            logger.info("Installing Hunyuan Paint custom rasterizer from %s", rasterizer_root)
+            cmd = [sys.executable, "-m", "pip", "install", "-e", str(rasterizer_root)]
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                env={**os.environ, "CUDA_HOME": CUDA_HOME},
+            )
+            if result.returncode == 0:
+                try:
+                    import custom_rasterizer  # noqa: F401
+                    compiled = True
+                except (ModuleNotFoundError, ImportError):
+                    pass
+            if not compiled:
+                logger.warning(
+                    "Compilation of custom_rasterizer failed:\n%s",
+                    self._summarize_output(result.stderr),
+                )
+
+        if compiled:
+            return
+
+        # ----------------------------------------------------------
+        # Pure-PyTorch fallback
+        # ----------------------------------------------------------
+        logger.warning(
+            "custom_rasterizer C++ extension is not available and cannot be "
+            "compiled (CUDA_HOME=%s).  Using a pure-PyTorch software "
+            "rasterizer fallback.  Texture baking will be significantly "
+            "slower but functionally correct.",
+            CUDA_HOME,
+        )
+
+        from .rasterizer_fallback import (
+            rasterize_image,
+            build_hierarchy,
+            build_hierarchy_with_feat,
+        )
+
+        # Register the fallback as ``custom_rasterizer_kernel`` so that the
+        # existing ``custom_rasterizer.render`` module can import it.
+        kernel_mod = types.ModuleType("custom_rasterizer_kernel")
+        kernel_mod.rasterize_image = rasterize_image
+        kernel_mod.build_hierarchy = build_hierarchy
+        kernel_mod.build_hierarchy_with_feat = build_hierarchy_with_feat
+        sys.modules["custom_rasterizer_kernel"] = kernel_mod
+
+        # Also register the ``custom_rasterizer`` package itself so that
+        # ``import custom_rasterizer`` and ``custom_rasterizer.rasterize``
+        # resolve correctly.
+        cr_pkg = types.ModuleType("custom_rasterizer")
+        cr_pkg.__path__ = [str(rasterizer_root / "custom_rasterizer")]
+        sys.modules["custom_rasterizer"] = cr_pkg
+
+        # Import the high-level render module that wraps the kernel.
+        from custom_rasterizer.render import rasterize, interpolate  # noqa: F401
+        cr_pkg.rasterize = rasterize
+        cr_pkg.interpolate = interpolate
+
+    @staticmethod
+    def _install_realesrgan_fallback() -> None:
+        """Register a pure-PIL fallback for ``image_super_utils.imageSuperNet``.
+
+        RealESRGAN (and its dependency basicsr) often fails to install or
+        import on Windows because basicsr requires C++ extensions that may
+        not compile.  When that happens, we monkey-patch the upstream
+        ``image_super_utils`` module so that the Paint pipeline still loads:
+        instead of RealESRGAN 4x super-resolution, textures are upscaled
+        with PIL Lanczos resampling.  Quality is slightly lower but the
+        pipeline remains fully functional.
+        """
+        import importlib
+
+        # Check if realesrgan is actually importable.
+        try:
+            importlib.import_module("realesrgan")
+            importlib.import_module("basicsr")
+            return  # Both available — no fallback needed.
+        except Exception:
+            pass
+
+        logger.warning(
+            "realesrgan / basicsr are not importable (common on Windows). "
+            "Texture super-resolution will use PIL Lanczos upscaling as a "
+            "fallback.  To enable RealESRGAN, install manually:\n"
+            "  pip install basicsr==1.4.2 realesrgan==0.3.0"
+        )
+
+        # Build a drop-in replacement module so that
+        #   from utils.image_super_utils import imageSuperNet
+        # inside the Paint code resolves without error.
+        fallback_mod = types.ModuleType("utils.image_super_utils")
+
+        class _LanczosSuperNet:
+            """PIL-based 4x upscaler used when RealESRGAN is unavailable."""
+
+            def __init__(self, config) -> None:
+                self.scale = 4
+
+            def __call__(self, image):
+                w, h = image.size
+                return image.resize(
+                    (w * self.scale, h * self.scale), Image.LANCZOS
+                )
+
+        fallback_mod.imageSuperNet = _LanczosSuperNet
+        sys.modules["utils.image_super_utils"] = fallback_mod
+
+        # Attach the fallback as an attribute of the *real* ``utils`` package
+        # that lives inside ``hy3dpaint/``.  Earlier code
+        # (``_prepare_paint_imports``) already placed ``hy3dpaint/`` on
+        # ``sys.path``, so ``import utils`` resolves to the filesystem package.
+        # We must NOT create a bare ``types.ModuleType("utils")`` stub here
+        # because that would shadow the real package and break every other
+        # ``from utils.<submod> import ...`` in the Paint codebase (e.g.
+        # ``utils.simplify_mesh_utils``).
+        if "utils" not in sys.modules:
+            try:
+                import utils  # noqa: F401 — imports the real hy3dpaint/utils package
+            except ImportError:
+                # Last resort: create a namespace stub only if the real
+                # package genuinely cannot be found on sys.path.
+                sys.modules["utils"] = types.ModuleType("utils")
+        parent = sys.modules["utils"]
+        if not hasattr(parent, "image_super_utils"):
+            parent.image_super_utils = fallback_mod
+
+    def _ensure_python_dependencies(self, code_root: Path) -> None:
+        """Install Python-side Paint dependencies that are safe to auto-setup."""
+        from .deps import ensure_package
+
+        ensure_package("pybind11", pip_spec="pybind11>=2.13.4")
+
+        # RealESRGAN + basicsr: attempt to install, but tolerate failure
+        # (common on Windows where basicsr's C++ extensions fail to compile).
+        for pkg, spec in [("basicsr", "basicsr==1.4.2"), ("realesrgan", "realesrgan==0.3.0")]:
+            try:
+                ensure_package(pkg, pip_spec=spec)
+            except (ImportError, RuntimeError) as exc:
+                logger.warning(
+                    "Optional dependency '%s' could not be installed: %s. "
+                    "A PIL-based fallback will be used for texture upscaling.",
+                    pkg,
+                    exc,
+                )
+
+        # If realesrgan still cannot be imported, register the PIL fallback
+        # *before* the Paint pipeline tries to import image_super_utils.
+        self._install_realesrgan_fallback()
+
+        # Only download the ~67 MB RealESRGAN checkpoint if the package is
+        # actually usable; the PIL fallback does not need it.
+        try:
+            importlib.import_module("realesrgan")
+            self._ensure_realesrgan_weights(code_root)
+        except ImportError:
+            pass
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -67,13 +328,29 @@ class Hunyuan3DPaintWrapper:
                 "  git clone https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1.git"
             )
 
-        if code_root not in sys.path:
-            sys.path.insert(0, code_root)
+        code_root_path = Path(code_root)
+        self._prepare_paint_imports(code_root_path)
+        self._ensure_python_dependencies(code_root_path)
 
-        from hy3dpaint.textureGenPipeline import (
-            Hunyuan3DPaintConfig,
-            Hunyuan3DPaintPipeline,
-        )
+        try:
+            from hy3dpaint.textureGenPipeline import (
+                Hunyuan3DPaintConfig,
+                Hunyuan3DPaintPipeline,
+            )
+        except ModuleNotFoundError as exc:
+            missing_name = exc.name or "an internal Hunyuan3D Paint dependency"
+            raise ImportError(
+                "Hunyuan3D Paint dependencies are not fully available. "
+                f"Missing module: {missing_name}\n"
+                "Paint expects the local repo checkout plus compiled renderer "
+                "extensions. Ensure these steps have been completed:\n"
+                "  1. cd Hunyuan3D-2.1/hy3dpaint/custom_rasterizer && pip install -e .\n"
+                "  2. cd Hunyuan3D-2.1/hy3dpaint/DifferentiableRenderer && bash compile_mesh_painter.sh\n"
+                "  3. Download RealESRGAN_x4plus.pth into hy3dpaint/ckpt/\n"
+                "After that, rerun the full backend."
+            ) from exc
+
+        self._ensure_custom_rasterizer(code_root_path)
 
         logger.info("Configuring Hunyuan3D Paint pipeline...")
         config = Hunyuan3DPaintConfig(max_num_view=self.max_views, resolution=self.resolution)
@@ -82,29 +359,33 @@ class Hunyuan3DPaintWrapper:
 
         # Adjust paths relative to code root
         config.multiview_cfg_path = str(
-            Path(code_root) / "hy3dpaint" / "cfgs" / "hunyuan-paint-pbr.yaml"
+            code_root_path / "hy3dpaint" / "cfgs" / "hunyuan-paint-pbr.yaml"
         )
         config.custom_pipeline = str(
-            Path(code_root) / "hy3dpaint" / "hunyuanpaintpbr"
+            code_root_path / "hy3dpaint" / "hunyuanpaintpbr"
         )
         config.realesrgan_ckpt_path = str(
-            Path(code_root) / "hy3dpaint" / "ckpt" / "RealESRGAN_x4plus.pth"
+            code_root_path / "hy3dpaint" / "ckpt" / "RealESRGAN_x4plus.pth"
         )
 
         logger.info("Loading Hunyuan3D Paint pipeline...")
         self.pipeline = Hunyuan3DPaintPipeline(config)
 
-        # Apply MMGP offloading to keep VRAM under budget
+        # Auto-install and apply MMGP offloading to keep VRAM under budget
+        from .deps import ensure_package
+
         try:
+            ensure_package("mmgp", pip_spec="mmgp>=0.9.0")
             from mmgp import offload, profile_type
 
             profile = getattr(profile_type, self.mmgp_profile, profile_type.LowRAM_LowVRAM)
             offload.profile(self.pipeline, profile)
             logger.info(f"MMGP offloading enabled ({self.mmgp_profile}).")
-        except ImportError:
+        except Exception as exc:
             logger.warning(
-                "mmgp not installed. Paint pipeline runs without memory offloading. "
-                "May OOM on GPUs < 24GB. Install: pip install mmgp"
+                "MMGP offloading unavailable (%s). Paint pipeline runs without "
+                "memory offloading — may OOM on GPUs < 24GB.",
+                exc,
             )
 
         self._initialized = True
@@ -183,7 +464,7 @@ class Hunyuan3DPaintWrapper:
                     image_path=ref_path,
                     output_mesh_path=obj_output,
                     use_remesh=use_remesh,
-                    save_glb=True,
+                    save_glb=False,
                 )
         except Exception as e:
             logger.error(f"Hunyuan3D Paint failed: {e}")

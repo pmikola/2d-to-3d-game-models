@@ -171,6 +171,36 @@ def unload_gpu_model(model_attr_name: str, obj: object) -> None:
         logger.info(f"GPU after unload [{model_attr_name}]: {allocated:.2f}GB alloc, {reserved:.2f}GB reserved")
 
 
+def release_runtime_memory(label: str = "") -> None:
+    """
+    Run aggressive Python/CUDA cleanup between pipeline stages.
+
+    This does not guarantee the OS or WDDM immediately returns every page, but
+    it drops Python references, clears PyTorch's CUDA cache, and logs the
+    allocator state so stage boundaries are explicit in the logs.
+    """
+    import gc
+
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+        allocated = torch.cuda.memory_allocated() / (1024**3)
+        reserved = torch.cuda.memory_reserved() / (1024**3)
+        logger.info(
+            "Runtime cleanup [%s]: %.2fGB alloc / %.2fGB reserved",
+            label or "unnamed",
+            allocated,
+            reserved,
+        )
+
+
 def log_vram_status(label: str = "") -> None:
     """Log current VRAM usage."""
     if torch.cuda.is_available():

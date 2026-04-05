@@ -68,6 +68,7 @@ def load_config_from_yaml(yaml_path: str) -> PipelineConfig:
         backend=pipeline_cfg.get("backend", "hunyuan3d"),
         target_size=preprocessing.get("target_size", 512),
         remove_background=preprocessing.get("remove_background", True),
+        bg_model=preprocessing.get("bg_model", "birefnet-general"),
         geometry_seed=geometry.get("seed", 42),
         geometry_guidance_scale=geometry.get("guidance_scale", 7.5),
         geometry_steps=geometry.get("num_inference_steps", 50),
@@ -82,8 +83,8 @@ def load_config_from_yaml(yaml_path: str) -> PipelineConfig:
         game_ready=pipeline_cfg.get("game_ready", True),
         game_ready_target_faces=pipeline_cfg.get("game_ready_target_faces", 50000),
         force_cpu=device.get("force_cpu", False),
-        # Zero123++ multi-view
-        zero123_steps=zero123.get("num_inference_steps", 75),
+        # MV-Adapter multi-view
+        zero123_steps=zero123.get("num_inference_steps", 50),
         zero123_guidance_scale=zero123.get("guidance_scale", 4.0),
         # Exposure correction
         correct_exposure=exposure.get("enabled", False),
@@ -164,7 +165,7 @@ Examples:
         default=None,
         help=(
             "Pipeline backend: 'hunyuan3d' (default) uses Hunyuan3D-2.1 fp16 "
-            "shape generation; 'full' runs the 5-stage pipeline (Zero123++ -> "
+            "shape generation; 'full' runs the 5-stage pipeline (MV-Adapter -> "
             "Hunyuan3D-2mv -> mesh repair -> Hunyuan3D Paint -> PBR GLB); "
             "'triposg' uses TripoSG geometry; 'hi3dgen' preserves the legacy "
             "geometry+texture pipeline"
@@ -245,7 +246,7 @@ Examples:
         "--zero123-steps",
         type=int,
         default=None,
-        help="Number of inference steps for Zero123++ multi-view generation (default: 75)",
+        help="Number of inference steps for MV-Adapter multi-view generation (default: 50)",
     )
     parser.add_argument(
         "--octree-resolution",

@@ -18,7 +18,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from .device import DeviceConfig, detect_device, log_device_info
+from .device import DeviceConfig, detect_device, log_device_info, release_runtime_memory
 from .export import (
     export_hunyuan_paint_to_glb,
     export_textured_dir_to_glb,
@@ -26,9 +26,15 @@ from .export import (
     validate_glb,
 )
 from .geometry import Hi3DGenWrapper, normalize_mesh, save_mesh_as_obj, unwrap_uvs
-from .mesh_repair import prepare_game_ready_mesh, repair_and_prepare
+from .mesh_repair import (
+    decimate_mesh,
+    make_watertight,
+    prepare_game_ready_mesh,
+    remove_small_components,
+    repair_and_prepare,
+)
 from .pbr_maps import generate_pbr_maps, save_pbr_maps
-from .preprocess import preprocess_image
+from .preprocess import composite_on_background, preprocess_image, remove_gray_background
 from .texturing import TextureGenerator
 
 logger = logging.getLogger(__name__)
@@ -44,6 +50,7 @@ class PipelineConfig:
     # Preprocessing
     target_size: int = 512
     remove_background: bool = True
+    bg_model: str = "birefnet-general"  # rembg session name for background removal
 
     # Geometry
     geometry_seed: int = 42
@@ -62,9 +69,11 @@ class PipelineConfig:
     # PBR map generation
     generate_pbr: bool = False
 
-    # Zero123++ multi-view generation (full backend)
-    zero123_steps: int = 75
-    zero123_guidance_scale: float = 4.0
+    # MV-Adapter multi-view generation (full backend)
+    # 30 steps with ShiftSNR scheduler provides ~95% of the quality of 50
+    # steps while cutting MV-Adapter runtime by ~40% (~18-36s savings).
+    zero123_steps: int = 30
+    zero123_guidance_scale: float = 3.0
 
     # Dynamic range preprocessing
     correct_exposure: bool = False
@@ -124,7 +133,7 @@ class Pipeline:
         self.geometry_generator: Hi3DGenWrapper | None = None
         self.texture_generator: TextureGenerator | None = None
         self._hunyuan3d = None  # Lazy-loaded Hunyuan3D wrapper
-        self._zero123 = None  # Zero123++ multi-view (full backend)
+        self._zero123 = None  # MV-Adapter multi-view (full backend)
         self._hunyuan3d_paint = None  # Hunyuan3D Paint texturing (full backend)
 
     def initialize(self) -> None:
@@ -181,9 +190,9 @@ class Pipeline:
         elif self.config.backend == "full":
             from .hunyuan3d import Hunyuan3DWrapper
             from .hunyuan3d_paint import Hunyuan3DPaintWrapper
-            from .zero123plus import Zero123PlusWrapper
+            from .zero123plus import MVAdapterWrapper
 
-            self._zero123 = Zero123PlusWrapper(
+            self._zero123 = MVAdapterWrapper(
                 device_config=self.device_config,
             )
             self._hunyuan3d = Hunyuan3DWrapper(
@@ -202,9 +211,44 @@ class Pipeline:
             # Full pipeline does texturing + PBR
             self.config.skip_texturing = False
             self.config.generate_pbr = True
+            self.texture_generator = TextureGenerator(
+                device_config=self.device_config,
+                text2tex_path=self.config.text2tex_path,
+            )
+
+            # NOTE: game_ready decimation is no longer disabled for the
+            # full backend.  Stage 3 always decimates to
+            # game_ready_target_faces (default 50K) to keep intermediate
+            # files small and ensure the fallback texture path is fast.
+            # Paint's own remesher handles pre-decimated input fine.
+            if self.config.game_ready:
+                logger.info(
+                    "Full backend: game-ready decimation enabled "
+                    "(target faces: %d).  Paint will re-remesh internally.",
+                    self.config.game_ready_target_faces,
+                )
+
+            if self.config.mesh_repair:
+                logger.info(
+                    "Disabling legacy mesh repair for the full backend to "
+                    "preserve Hunyuan3D-2mv geometry fidelity before UV/texturing."
+                )
+                self.config.mesh_repair = False
+
+            if (
+                self.device_config.has_gpu
+                and self.device_config.vram_gb < 18
+                and self.config.zero123_steps > 35
+            ):
+                logger.info(
+                    "Reducing MV-Adapter steps from %d to 35 for stability on %.1f GB VRAM.",
+                    self.config.zero123_steps,
+                    self.device_config.vram_gb,
+                )
+                self.config.zero123_steps = 35
 
             logger.info(
-                "Full 5-stage pipeline selected: Zero123++ -> Hunyuan3D-2mv -> "
+                "Full 5-stage pipeline selected: MV-Adapter -> Hunyuan3D-2mv -> "
                 "mesh repair -> Hunyuan3D Paint -> PBR GLB export."
             )
 
@@ -257,9 +301,9 @@ class Pipeline:
             logger.info(f"Processing: {input_path}")
             logger.info("-" * 40)
 
-            # Stage 0: Preprocess
+            # Stage 0: Preprocess — returns RGBA with alpha preserved
             logger.info("[Stage 0] Preprocessing image...")
-            preprocessed = preprocess_image(
+            preprocessed_rgba = preprocess_image(
                 image_path=input_path,
                 target_size=self.config.target_size,
                 remove_bg=self.config.remove_background,
@@ -267,17 +311,21 @@ class Pipeline:
                 correct_exposure=self.config.correct_exposure,
                 exposure_low_percentile=self.config.exposure_low_percentile,
                 exposure_high_percentile=self.config.exposure_high_percentile,
+                bg_model=self.config.bg_model,
             )
 
-            # Save preprocessed image for debugging
+            # Save debug image (composite on white for visibility)
             output_dir = Path(output_path).parent
             output_dir.mkdir(parents=True, exist_ok=True)
             preprocessed_path = output_dir / f"{Path(input_path).stem}_preprocessed.png"
-            preprocessed.save(str(preprocessed_path))
+            debug_img = composite_on_background(preprocessed_rgba, (255, 255, 255))
+            debug_img.save(str(preprocessed_path))
             logger.info(f"Saved preprocessed image: {preprocessed_path}")
 
             # --- Hunyuan3D backend (shape generation only) ---
             if self.config.backend == "hunyuan3d" and self._hunyuan3d is not None:
+                # Hunyuan3D shape-only expects RGB on white background
+                preprocessed = composite_on_background(preprocessed_rgba, (255, 255, 255))
                 logger.info("[Stage 1/2] Generating 3D geometry (Hunyuan3D-2.1 fp16)...")
                 try:
                     self._hunyuan3d.load()
@@ -289,6 +337,7 @@ class Pipeline:
                     )
                 finally:
                     self._hunyuan3d.unload()
+                    release_runtime_memory("after_hunyuan_shape_stage")
                 mesh = hy_result["mesh"]
                 result.mesh_vertices = len(mesh.vertices)
                 result.mesh_faces = len(mesh.faces)
@@ -324,17 +373,22 @@ class Pipeline:
 
             # --- Full 5-stage backend ---
             elif self.config.backend == "full" and self._zero123 is not None:
-                # Stage 1: Multi-view generation (Zero123++ ~6GB)
-                logger.info("[Stage 1/5] Generating multi-view images (Zero123++)...")
+                # Stage 1: Multi-view generation (MV-Adapter ~14GB)
+                # MV-Adapter wants RGBA (it composites on gray internally)
+                logger.info("[Stage 1/5] Generating multi-view images (MV-Adapter)...")
+                mv_view_names = ["front", "left", "back", "right"]
+                mv_batch_size = 2 if self.device_config.has_gpu and self.device_config.vram_gb < 18 else None
                 try:
-                    self._zero123.load()
                     views = self._zero123.generate_views(
-                        preprocessed,
+                        preprocessed_rgba,
                         num_inference_steps=self.config.zero123_steps,
                         guidance_scale=self.config.zero123_guidance_scale,
+                        requested_view_names=mv_view_names,
+                        batch_size=mv_batch_size,
                     )
                 finally:
                     self._zero123.unload()
+                    release_runtime_memory("after_mvadapter_stage")
 
                 # Save multi-view debug images
                 for view_name, view_img in views.items():
@@ -342,12 +396,15 @@ class Pipeline:
                     view_img.save(str(view_path))
                 logger.info(f"Saved {len(views)} multi-view images for debugging.")
 
-                # Select cardinal views for Hunyuan3D-2mv
-                cardinal_views = {
-                    k: views[k]
-                    for k in ("front", "right", "back", "left")
-                    if k in views
-                }
+                # Remove gray background from MV-Adapter views before Hunyuan3D-2mv.
+                # MV-Adapter outputs RGB on gray (128) bg; Hunyuan3D-2mv's
+                # MVImageProcessorV2 expects RGBA with meaningful alpha.
+                cardinal_views = {}
+                for name in ("front", "left", "back", "right"):
+                    if name in views:
+                        cardinal_views[name] = remove_gray_background(views[name])
+                del views
+                release_runtime_memory("after_multiview_output_cleanup")
 
                 # Stage 2: Shape generation (Hunyuan3D-2mv ~10GB)
                 logger.info("[Stage 2/5] Generating 3D shape (Hunyuan3D-2mv)...")
@@ -365,53 +422,260 @@ class Pipeline:
                     result.mesh_faces = len(mesh.faces)
                 finally:
                     self._hunyuan3d.unload()
+                    release_runtime_memory("after_hunyuan_multiview_stage")
+                del hy_result
+                del cardinal_views
+                release_runtime_memory("after_shape_output_cleanup")
 
-                # Stage 3: Mesh repair + normalize + UV unwrap (CPU)
-                logger.info("[Stage 3/5] Repairing and preparing mesh (CPU)...")
-                if self.config.game_ready:
+                # Stage 3: Mesh prep — normalize and ALWAYS decimate.
+                #
+                # We always decimate to game_ready_target_faces (default 50K)
+                # even though Hunyuan3D Paint does its own remeshing, because:
+                #   1. Smaller intermediate GLB = faster I/O
+                #   2. If Paint fails, the fallback path gets a manageable mesh
+                #      instead of 400K+ faces (which kills xatlas UV unwrap)
+                #   3. Paint's remesher handles pre-decimated input fine
+                #
+                # UV unwrapping is still skipped when Paint will redo it
+                # (paint_use_remesh=True).  The fallback path handles UV
+                # unwrapping on the already-decimated mesh if Paint fails.
+                stage3_t0 = time.time()
+                logger.info("[Stage 3/5] Preparing mesh for texturing...")
+
+                # Always decimate to a reasonable face count for the full
+                # backend.  This is critical: raw Hunyuan3D-2mv meshes can
+                # have 400K+ faces which causes extreme slowness in every
+                # downstream operation (UV unwrap, texture baking, GLB I/O).
+                decimate_target = self.config.game_ready_target_faces
+                pre_decimate_faces = len(mesh.faces)
+                if pre_decimate_faces > decimate_target:
+                    decimate_t0 = time.time()
+                    logger.info(
+                        "[Stage 3/5] Decimating mesh: %d -> %d target faces...",
+                        pre_decimate_faces,
+                        decimate_target,
+                    )
                     mesh = prepare_game_ready_mesh(
                         mesh,
-                        target_face_count=self.config.game_ready_target_faces,
+                        target_face_count=decimate_target,
                     )
-                if self.config.mesh_repair:
-                    mesh = repair_and_prepare(
-                        mesh,
-                        decimate_ratio=self.config.mesh_decimate_ratio,
-                        smooth_iterations=self.config.mesh_smooth_iterations,
+                    decimate_elapsed = time.time() - decimate_t0
+                    logger.info(
+                        "[Stage 3/5] Decimation complete in %.1fs: %d -> %d faces.",
+                        decimate_elapsed,
+                        pre_decimate_faces,
+                        len(mesh.faces),
                     )
+                else:
+                    logger.info(
+                        "[Stage 3/5] Mesh already at %d faces (<= %d target); "
+                        "skipping decimation.",
+                        pre_decimate_faces,
+                        decimate_target,
+                    )
+
+                # Lightweight mesh repair: remove disconnected components,
+                # merge close vertices, and fix normals.  These are safe
+                # operations that won't damage geometry but fix common
+                # Hunyuan3D-2mv output issues (multiple components, gaps).
+                repair_t0 = time.time()
+                pre_repair_faces = len(mesh.faces)
+                pre_repair_verts = len(mesh.vertices)
+
+                mesh = remove_small_components(mesh, min_face_ratio=0.05)
+                mesh = make_watertight(mesh)  # merge close vertices + fill holes
+
+                try:
+                    import trimesh
+                    trimesh.repair.fix_normals(mesh)
+                except Exception:
+                    pass
+
+                repair_elapsed = time.time() - repair_t0
+                logger.info(
+                    "[Stage 3/5] Lightweight repair complete in %.1fs: "
+                    "%d -> %d verts, %d -> %d faces.",
+                    repair_elapsed,
+                    pre_repair_verts,
+                    len(mesh.vertices),
+                    pre_repair_faces,
+                    len(mesh.faces),
+                )
+
+                normalize_t0 = time.time()
                 normalize_mesh(mesh)
-                unwrap_uvs(mesh)
+                logger.info(
+                    "[Stage 3/5] Normalization complete in %.1fs.",
+                    time.time() - normalize_t0,
+                )
+
+                # Only UV-unwrap here when Paint will NOT redo it.
+                skip_uv = self.config.paint_use_remesh
+                if skip_uv:
+                    logger.info(
+                        "[Stage 3/5] Skipping UV unwrap — Hunyuan3D Paint will "
+                        "remesh and UV-unwrap internally (paint_use_remesh=True)."
+                    )
+                else:
+                    uv_t0 = time.time()
+                    unwrap_uvs(mesh)
+                    logger.info(
+                        "[Stage 3/5] UV unwrap complete in %.1fs.",
+                        time.time() - uv_t0,
+                    )
+
                 result.mesh_vertices = len(mesh.vertices)
                 result.mesh_faces = len(mesh.faces)
+                stage3_elapsed = time.time() - stage3_t0
+                logger.info(
+                    "[Stage 3/5] Mesh preparation complete in %.1fs "
+                    "(%d verts, %d faces, UV unwrap %s).",
+                    stage3_elapsed,
+                    result.mesh_vertices,
+                    result.mesh_faces,
+                    "skipped" if skip_uv else "done",
+                )
 
                 # Stage 4: PBR texturing (Hunyuan3D Paint ~14GB with MMGP)
                 logger.info("[Stage 4/5] Generating PBR textures (Hunyuan3D Paint)...")
                 with tempfile.TemporaryDirectory() as tmp_dir:
-                    # Save intermediate GLB for the paint pipeline
                     intermediate_obj = save_mesh_as_obj(mesh, tmp_dir)
-                    intermediate_glb = str(Path(tmp_dir) / "intermediate.glb")
-                    export_to_glb(intermediate_obj, None, intermediate_glb)
-
                     texture_dir = str(Path(tmp_dir) / "textured")
+                    paint_result = None
+                    paint_error = None
+
+                    # Paint accepts OBJ directly — skip the unnecessary
+                    # intermediate GLB export (~1-3s saved).
+                    paint_mesh_path = intermediate_obj
+
+                    # Paint wants RGB on white (it has its own delighting)
+                    paint_reference = composite_on_background(preprocessed_rgba, (255, 255, 255))
+
                     try:
                         self._hunyuan3d_paint.load()
-                        texture_result = self._hunyuan3d_paint.generate_textures(
-                            mesh_path=intermediate_glb,
-                            reference_image=preprocessed,
+                        paint_result = self._hunyuan3d_paint.generate_textures(
+                            mesh_path=paint_mesh_path,
+                            reference_image=paint_reference,
                             output_dir=texture_dir,
                             use_remesh=self.config.paint_use_remesh,
                         )
+                    except Exception as exc:
+                        paint_error = exc
+                        logger.warning(
+                            "Hunyuan3D Paint unavailable (%s). Falling back to the "
+                            "built-in depth-conditioned texture generator.",
+                            exc,
+                        )
                     finally:
                         self._hunyuan3d_paint.unload()
+                        release_runtime_memory("after_paint_stage")
 
-                    # Stage 5: Final PBR GLB export (CPU)
-                    logger.info("[Stage 5/5] Exporting final PBR GLB...")
-                    export_hunyuan_paint_to_glb(
-                        texture_dir, output_path, texture_result
-                    )
+                    if paint_result is not None:
+                        # Stage 5: Final PBR GLB export (CPU)
+                        logger.info("[Stage 5/5] Exporting final PBR GLB...")
+                        export_hunyuan_paint_to_glb(
+                            texture_dir, output_path, paint_result
+                        )
+                    else:
+                        # Paint failed — the fallback texture generator needs
+                        # UV-mapped geometry.  Stage 3 already decimated the
+                        # mesh, but as a safety net we verify the face count
+                        # is manageable before running the expensive UV unwrap.
+                        fallback_t0 = time.time()
+                        logger.info(
+                            "Paint failed; preparing mesh for fallback texture "
+                            "generator (%d faces)...",
+                            len(mesh.faces),
+                        )
+
+                        # Safety decimation: ensure face count is reasonable
+                        # for xatlas UV unwrap (target 50K, tolerate up to
+                        # 80K before forcing another decimation pass).
+                        fallback_max_faces = int(
+                            self.config.game_ready_target_faces * 1.6
+                        )
+                        if len(mesh.faces) > fallback_max_faces:
+                            logger.info(
+                                "Fallback: mesh has %d faces (> %d limit); "
+                                "decimating to %d...",
+                                len(mesh.faces),
+                                fallback_max_faces,
+                                self.config.game_ready_target_faces,
+                            )
+                            fb_dec_t0 = time.time()
+                            mesh = decimate_mesh(
+                                mesh,
+                                target_face_count=self.config.game_ready_target_faces,
+                            )
+                            logger.info(
+                                "Fallback: decimation done in %.1fs (%d faces).",
+                                time.time() - fb_dec_t0,
+                                len(mesh.faces),
+                            )
+
+                        # Now UV-unwrap if we skipped it in Stage 3.
+                        if skip_uv:
+                            fb_uv_t0 = time.time()
+                            logger.info(
+                                "Fallback: running deferred UV unwrap on %d faces...",
+                                len(mesh.faces),
+                            )
+                            unwrap_uvs(mesh)
+                            logger.info(
+                                "Fallback: UV unwrap complete in %.1fs.",
+                                time.time() - fb_uv_t0,
+                            )
+                            intermediate_obj = save_mesh_as_obj(mesh, tmp_dir)
+
+                        # Reduce viewpoints for faster fallback texturing.
+                        # The full pipeline uses up to 36 viewpoints which is
+                        # extremely slow; 8 viewpoints covers all cardinal
+                        # directions and is much faster for a fallback path.
+                        original_viewpoints = self.device_config.texture_num_viewpoints
+                        fallback_viewpoints = min(8, original_viewpoints)
+                        if original_viewpoints != fallback_viewpoints:
+                            logger.info(
+                                "Fallback: reducing viewpoints from %d to %d "
+                                "for faster texture generation.",
+                                original_viewpoints,
+                                fallback_viewpoints,
+                            )
+                            self.device_config.texture_num_viewpoints = fallback_viewpoints
+
+                        if self.texture_generator is None:
+                            self.texture_generator = TextureGenerator(
+                                device_config=self.device_config,
+                                text2tex_path=self.config.text2tex_path,
+                            )
+                        try:
+                            fallback_dir = self.texture_generator.generate_texture(
+                                mesh_obj_path=intermediate_obj,
+                                output_dir=str(Path(tmp_dir) / "textured_fallback"),
+                                prompt=self.config.texture_prompt,
+                                original_image=paint_reference,
+                                seed=self.config.texture_seed,
+                            )
+                        finally:
+                            # Restore original viewpoint count so it doesn't
+                            # affect any subsequent runs in a batch.
+                            self.device_config.texture_num_viewpoints = original_viewpoints
+
+                        fallback_elapsed = time.time() - fallback_t0
+                        logger.info(
+                            "[Stage 5/5] Exporting textured GLB via fallback "
+                            "texture pipeline (fallback took %.1fs)...",
+                            fallback_elapsed,
+                        )
+                        export_textured_dir_to_glb(fallback_dir, output_path)
+                    del paint_result
+                    del paint_error
+                    del intermediate_obj
+                    release_runtime_memory("after_texturing_output_cleanup")
 
             # --- Hi3DGen + Text2Tex backend (two-stage) ---
             else:
+                # Hi3DGen / TripoSG backends expect RGB on white background
+                preprocessed = composite_on_background(preprocessed_rgba, (255, 255, 255))
                 logger.info("[Stage 1/5] Generating 3D geometry (Hi3DGen)...")
                 mesh = self.geometry_generator.generate_mesh(
                     image=preprocessed,

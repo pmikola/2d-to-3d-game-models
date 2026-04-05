@@ -16,6 +16,7 @@ import logging
 import os
 from pathlib import Path
 import sys
+import types
 
 import numpy as np
 from PIL import Image
@@ -27,7 +28,7 @@ HUNYUAN3D_REPO_ID = "tencent/Hunyuan3D-2.1"
 HUNYUAN3D_SHAPE_SUBFOLDER = "hunyuan3d-dit-v2-1"
 HUNYUAN3D_REPO_DIRNAME = "Hunyuan3D-2.1"
 
-# Multi-view variant for use with Zero123++ views
+# Multi-view variant for use with MV-Adapter views
 HUNYUAN3D_2MV_REPO_ID = "tencent/Hunyuan3D-2mv"
 HUNYUAN3D_2MV_SUBFOLDER = "hunyuan3d-dit-v2-mv"
 
@@ -42,7 +43,13 @@ class Hunyuan3DWrapper:
       - no texture/PBR generation
     """
 
-    def __init__(self, device_config, model_path: str | None = None, variant: str = "single"):
+    def __init__(
+        self,
+        device_config,
+        model_path: str | None = None,
+        variant: str = "single",
+        enable_flashvdm: bool = True,
+    ):
         """
         Initialize Hunyuan3D-2.1 wrapper.
 
@@ -52,10 +59,15 @@ class Hunyuan3DWrapper:
                 the official checkpoint is used (varies by variant).
             variant: ``"single"`` for the default single-image shape pipeline,
                 ``"multiview"`` for the Hunyuan3D-2mv multi-view shape pipeline.
+            enable_flashvdm: Enable FlashVDM turbo VAE decoder for faster mesh
+                extraction.  This replaces the standard VAE with a turbo variant
+                that is 2-4x faster with equivalent output quality.
+                Default ``True``.
         """
         self.device_config = device_config
         self.model_path = model_path
         self.variant = variant
+        self.enable_flashvdm = enable_flashvdm
         self.pipeline = None
         self._initialized = False
 
@@ -102,9 +114,44 @@ class Hunyuan3DWrapper:
                 package_root_str = str(package_root)
                 if package_root_str not in sys.path:
                     sys.path.insert(0, package_root_str)
+                self._register_legacy_hy3dgen_aliases()
                 logger.info(f"Using local Hunyuan3D-2.1 code checkout: {repo_root}")
                 return True
         return False
+
+    @staticmethod
+    def _register_legacy_hy3dgen_aliases() -> None:
+        """
+        Expose ``hy3dshape`` modules under the legacy ``hy3dgen.shapegen``
+        namespace expected by some Hunyuan config files, especially 2mv.
+        """
+        hy3dshape_root = import_module("hy3dshape")
+        alias_map = {
+            "hy3dgen.shapegen": hy3dshape_root,
+            "hy3dgen.shapegen.models": import_module("hy3dshape.models"),
+            "hy3dgen.shapegen.schedulers": import_module("hy3dshape.schedulers"),
+            "hy3dgen.shapegen.preprocessors": import_module("hy3dshape.preprocessors"),
+            "hy3dgen.shapegen.pipelines": import_module("hy3dshape.pipelines"),
+            "hy3dgen.shapegen.utils": import_module("hy3dshape.utils"),
+        }
+
+        hy3dgen_pkg = sys.modules.get("hy3dgen")
+        if hy3dgen_pkg is None:
+            hy3dgen_pkg = types.ModuleType("hy3dgen")
+            hy3dgen_pkg.__path__ = []  # Mark as package-like for importlib.
+            sys.modules["hy3dgen"] = hy3dgen_pkg
+
+        shapegen_pkg = alias_map["hy3dgen.shapegen"]
+        setattr(hy3dgen_pkg, "shapegen", shapegen_pkg)
+
+        for alias_name, module in alias_map.items():
+            sys.modules[alias_name] = module
+
+        setattr(shapegen_pkg, "models", alias_map["hy3dgen.shapegen.models"])
+        setattr(shapegen_pkg, "schedulers", alias_map["hy3dgen.shapegen.schedulers"])
+        setattr(shapegen_pkg, "preprocessors", alias_map["hy3dgen.shapegen.preprocessors"])
+        setattr(shapegen_pkg, "pipelines", alias_map["hy3dgen.shapegen.pipelines"])
+        setattr(shapegen_pkg, "utils", alias_map["hy3dgen.shapegen.utils"])
 
     def _import_shape_pipeline(self):
         """Import the Hunyuan shape pipeline from the best available source."""
@@ -140,18 +187,27 @@ class Hunyuan3DWrapper:
         Returns:
             Tuple of (model source, optional subfolder).
         """
+        default_repo = (
+            HUNYUAN3D_2MV_REPO_ID if self.variant == "multiview" else HUNYUAN3D_REPO_ID
+        )
+        default_subfolder = (
+            HUNYUAN3D_2MV_SUBFOLDER
+            if self.variant == "multiview"
+            else HUNYUAN3D_SHAPE_SUBFOLDER
+        )
+
         if not self.model_path:
             if self.variant == "multiview":
                 logger.info(
                     f"Using official Hunyuan3D-2mv model: "
-                    f"{HUNYUAN3D_2MV_REPO_ID}/{HUNYUAN3D_2MV_SUBFOLDER}"
+                    f"{default_repo}/{default_subfolder}"
                 )
-                return HUNYUAN3D_2MV_REPO_ID, HUNYUAN3D_2MV_SUBFOLDER
-            logger.info(
-                "Using official Hunyuan3D-2.1 fp16 shape model: "
-                f"{HUNYUAN3D_REPO_ID}/{HUNYUAN3D_SHAPE_SUBFOLDER}"
-            )
-            return HUNYUAN3D_REPO_ID, HUNYUAN3D_SHAPE_SUBFOLDER
+            else:
+                logger.info(
+                    "Using official Hunyuan3D-2.1 fp16 shape model: "
+                    f"{default_repo}/{default_subfolder}"
+                )
+            return default_repo, default_subfolder
 
         model_dir = Path(self.model_path)
         if model_dir.exists():
@@ -159,21 +215,28 @@ class Hunyuan3DWrapper:
                 logger.info(f"Using local Hunyuan3D shape checkpoint: {model_dir}")
                 return str(model_dir), None
 
-            if (model_dir / HUNYUAN3D_SHAPE_SUBFOLDER / "config.yaml").exists():
+            if (model_dir / default_subfolder / "config.yaml").exists():
                 logger.info(f"Using local Hunyuan3D repo checkout: {model_dir}")
-                return str(model_dir), HUNYUAN3D_SHAPE_SUBFOLDER
+                return str(model_dir), default_subfolder
 
             logger.warning(
                 "Custom Hunyuan3D model path does not match the expected repo layout. "
-                "Attempting to load it as a repo root with the shape subfolder."
+                "Attempting to load it as a repo root with the expected subfolder."
             )
-            return str(model_dir), HUNYUAN3D_SHAPE_SUBFOLDER
+            return str(model_dir), default_subfolder
+
+        if self.variant == "multiview" and self.model_path == HUNYUAN3D_REPO_ID:
+            logger.info(
+                "Configured model repo points to single-view Hunyuan3D-2.1 weights. "
+                f"Switching to official multi-view repo: {default_repo}/{default_subfolder}"
+            )
+            return default_repo, default_subfolder
 
         logger.info(
             "Treating configured Hunyuan model path as a Hugging Face repo ID: "
             f"{self.model_path}"
         )
-        return self.model_path, HUNYUAN3D_SHAPE_SUBFOLDER
+        return self.model_path, default_subfolder
 
     def initialize(self) -> None:
         """
@@ -259,6 +322,35 @@ class Hunyuan3DWrapper:
         # Keep the internal model in fp16 on CUDA when the API exposes it.
         if hasattr(self.pipeline, "to"):
             self.pipeline.to(device=device, dtype=dtype)
+
+        # Enable FlashVDM turbo VAE decoder when available.  This replaces
+        # the standard VAE with a turbo variant that accelerates mesh
+        # extraction (the latents2mesh step) by 2-4x with no quality loss.
+        # NOTE: FlashVDM is only compatible with the single-view Hunyuan3D-2.1
+        # checkpoint.  The 2mv (multi-view) variant has a different VAE
+        # architecture and will fail with a state_dict mismatch.
+        if (
+            self.enable_flashvdm
+            and self.variant != "multiview"
+            and hasattr(self.pipeline, "enable_flashvdm")
+        ):
+            try:
+                self.pipeline.enable_flashvdm(enabled=True)
+                logger.info(
+                    "FlashVDM turbo VAE decoder enabled for faster mesh "
+                    "extraction."
+                )
+            except Exception as exc:
+                logger.warning(
+                    "FlashVDM turbo VAE decoder could not be enabled (%s). "
+                    "Falling back to standard VAE decoder.",
+                    exc,
+                )
+        elif self.variant == "multiview" and self.enable_flashvdm:
+            logger.info(
+                "FlashVDM skipped — not compatible with the Hunyuan3D-2mv "
+                "multi-view variant."
+            )
 
     def generate(
         self,

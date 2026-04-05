@@ -13,6 +13,7 @@ pipeline:
 preprocessing:
   target_size: 512           # Image resize target (matches Hi3DGen's NiRNE input)
   remove_background: true    # Use rembg for background removal
+  bg_model: "birefnet-general"  # rembg model for bg removal (birefnet-general, u2net, etc.)
   quality_check: true        # Warn on low-res or blurry images
 
 # Geometry Generation (Hi3DGen)
@@ -52,10 +53,12 @@ export:
   metallic_factor: 0.0       # PBR metallic factor
   roughness_factor: 0.8      # PBR roughness factor
 
-# Zero123++ multi-view generation (used by "full" backend)
+# MV-Adapter multi-view generation (used by "full" backend)
+# Replaces Zero123++ with MV-Adapter (ICCV 2025) for higher resolution
+# (768x768 vs 320x320) and better view consistency. ~14GB VRAM.
 zero123:
-  num_inference_steps: 75
-  guidance_scale: 4.0
+  num_inference_steps: 50
+  guidance_scale: 3.0
 
 # Dynamic range / exposure correction
 exposure:
