@@ -440,22 +440,33 @@ def run_paint(mesh_glb: str, image_path: str, output_glb: str,
 def main():
     args = parse_args()
 
-    # Resolve output path
-    output = args.output
-    if output is None:
-        stem = Path(args.image).stem
-        Path("output").mkdir(exist_ok=True)
-        output = f"output/{stem}.glb"
-
     # Verify input exists
     if not Path(args.image).exists():
         print(f"ERROR: Image not found: {args.image}")
         return 1
 
+    # Create output folder: output/<image_name>/
+    stem = Path(args.image).stem
+    if args.output:
+        out_dir = Path(args.output).parent
+        final_glb = args.output
+    else:
+        out_dir = Path("output") / stem
+        final_glb = str(out_dir / f"{stem}.glb")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"[output] All results will be saved to: {out_dir}/")
+
     total_t0 = time.time()
 
     # Stage 1 — Shape
-    shape_glb = output.replace(".glb", "_shape.glb") if not args.no_texture else output
+    shape_glb = str(out_dir / f"{stem}_shape.glb")
+    if not args.no_texture:
+        # When texturing, shape is intermediate; final GLB comes from paint
+        pass
+    else:
+        final_glb = shape_glb
+
     run_shape(
         image_path=args.image,
         output_glb=shape_glb,
@@ -464,13 +475,19 @@ def main():
         seed=args.seed,
     )
 
+    # Copy preprocessed image to output folder for reference
+    preprocessed_src = Path("output") / f"{stem}_preprocessed.png"
+    if preprocessed_src.exists() and preprocessed_src.parent != out_dir:
+        import shutil
+        shutil.copy2(preprocessed_src, out_dir / preprocessed_src.name)
+
     # Stage 2 — Paint (skip if --no-texture)
     if not args.no_texture:
         try:
             run_paint(
                 mesh_glb=shape_glb,
                 image_path=args.image,
-                output_glb=output,
+                output_glb=final_glb,
                 max_views=args.paint_views,
                 resolution=args.paint_resolution,
             )
@@ -489,7 +506,9 @@ def main():
     total = time.time() - total_t0
     print(f"\n{'='*60}")
     print(f"COMPLETE in {total:.0f}s")
-    print(f"Output: {output}")
+    print(f"Output folder: {out_dir}/")
+    print(f"  Shape:    {shape_glb}")
+    print(f"  Textured: {final_glb}")
     print(f"Import in Blender: File > Import > glTF 2.0 (.glb/.gltf)")
     print(f"{'='*60}")
     return 0
