@@ -63,10 +63,18 @@ class Hunyuan3DPaintWrapper:
         """
         Match Tencent's expected import layout for Paint.
 
-        `textureGenPipeline.py` imports sibling modules like
-        `DifferentiableRenderer` and `utils` as top-level packages, so
-        `hy3dpaint` itself must be on `sys.path`. The custom rasterizer package
-        also lives one level deeper.
+        ``textureGenPipeline.py`` imports sibling modules like
+        ``DifferentiableRenderer`` and ``utils`` as top-level packages, so
+        ``hy3dpaint`` itself must be on ``sys.path``.  The custom rasterizer
+        package also lives one level deeper.
+
+        Critically, the ``utils`` package name is extremely common and can
+        easily be shadowed by another ``utils`` module already in
+        ``sys.modules`` (from pip-installed libraries, the CWD, etc.).  We
+        therefore *eagerly* import the real ``hy3dpaint/utils`` package here
+        and verify its ``__path__`` points to the correct directory so that
+        all downstream ``from utils.<submod> import ...`` calls resolve to
+        the Hunyuan Paint code.
         """
         paint_root = code_root / "hy3dpaint"
         rasterizer_root = paint_root / "custom_rasterizer"
@@ -76,20 +84,91 @@ class Hunyuan3DPaintWrapper:
             if path_str not in sys.path:
                 sys.path.insert(0, path_str)
 
-        # Hunyuan Paint imports `bpy` only for its optional OBJ->GLB helper.
-        # This project performs final GLB export itself, so a lightweight stub
-        # keeps the import path working on systems without Blender Python.
+        # ----------------------------------------------------------------
+        # Eagerly claim the ``utils`` top-level package for hy3dpaint/utils
+        # ----------------------------------------------------------------
+        expected_utils_dir = str(paint_root / "utils")
+        utils_mod = sys.modules.get("utils")
+        if utils_mod is not None:
+            # Already in sys.modules — verify it points to the right place.
+            existing_path = getattr(utils_mod, "__path__", None)
+            if existing_path is None or expected_utils_dir not in [
+                str(p) for p in existing_path
+            ]:
+                # Wrong ``utils`` (another library or a bare stub).  Replace
+                # it with the real package from hy3dpaint/.
+                logger.debug(
+                    "Replacing incorrect sys.modules['utils'] (path=%s) "
+                    "with hy3dpaint/utils (%s).",
+                    existing_path,
+                    expected_utils_dir,
+                )
+                del sys.modules["utils"]
+                # Also remove any cached sub-modules that belonged to the
+                # wrong parent.
+                for key in list(sys.modules):
+                    if key.startswith("utils."):
+                        del sys.modules[key]
+                utils_mod = None
+
+        if utils_mod is None:
+            # Import the real package.  Because ``paint_root`` is first on
+            # ``sys.path``, ``import utils`` will find ``hy3dpaint/utils/``.
+            try:
+                import utils as _utils_pkg  # noqa: F401
+            except ImportError:
+                # If import fails (unlikely, __init__.py is trivial), create
+                # a namespace-style stub with the correct __path__ so that
+                # sub-module imports still work.
+                _utils_pkg = types.ModuleType("utils")
+                _utils_pkg.__path__ = [expected_utils_dir]
+                _utils_pkg.__package__ = "utils"
+                sys.modules["utils"] = _utils_pkg
+                logger.debug(
+                    "Created utils namespace stub with __path__=%s",
+                    expected_utils_dir,
+                )
+
+        # Final safety check: guarantee __path__ is set correctly.
+        utils_in_sys = sys.modules.get("utils")
+        if utils_in_sys is not None and not getattr(utils_in_sys, "__path__", None):
+            utils_in_sys.__path__ = [expected_utils_dir]
+            utils_in_sys.__package__ = "utils"
+            logger.debug(
+                "Patched utils.__path__ to %s", expected_utils_dir
+            )
+
+        # ----------------------------------------------------------------
+        # bpy stub — Hunyuan Paint imports ``bpy`` only for its optional
+        # OBJ->GLB helper.  This project performs final GLB export itself,
+        # so a lightweight stub keeps the import path working on systems
+        # without Blender Python.
+        # ----------------------------------------------------------------
         try:
             import bpy  # noqa: F401
         except ModuleNotFoundError:
-            sys.modules.setdefault("bpy", types.ModuleType("bpy"))
+            bpy_stub = types.ModuleType("bpy")
+            # mesh_utils.py accesses bpy.data, bpy.context, bpy.ops, bpy.app
+            # at function call time (not import time).  Provide nested stubs
+            # so that the *import* of mesh_utils.py succeeds.  The functions
+            # that use bpy will fail at call time, which is fine because this
+            # project never calls convert_obj_to_glb through Blender.
+            bpy_stub.data = types.ModuleType("bpy.data")
+            bpy_stub.context = types.ModuleType("bpy.context")
+            bpy_stub.ops = types.ModuleType("bpy.ops")
+            bpy_stub.app = types.ModuleType("bpy.app")
+            bpy_stub.app.version = (4, 0, 0)
+            sys.modules.setdefault("bpy", bpy_stub)
 
-        # The C++ UV inpaint helper is an optional quality improvement. If it
-        # is unavailable we keep the pipeline usable by skipping the mesh-aware
-        # prefill step and letting the later OpenCV inpaint handle holes.
+        # ----------------------------------------------------------------
+        # DifferentiableRenderer.mesh_inpaint_processor — the C++ UV inpaint
+        # helper is an optional quality improvement.  If unavailable we keep
+        # the pipeline usable by skipping the mesh-aware prefill step and
+        # letting the later OpenCV inpaint handle holes.
+        # ----------------------------------------------------------------
         try:
             importlib.import_module("DifferentiableRenderer.mesh_inpaint_processor")
-        except ModuleNotFoundError:
+        except (ModuleNotFoundError, ImportError):
             fallback_mod = types.ModuleType("DifferentiableRenderer.mesh_inpaint_processor")
 
             def meshVerticeInpaint(texture, mask, vtx_pos, vtx_uv, pos_idx, uv_idx):
@@ -97,6 +176,16 @@ class Hunyuan3DPaintWrapper:
 
             fallback_mod.meshVerticeInpaint = meshVerticeInpaint
             sys.modules["DifferentiableRenderer.mesh_inpaint_processor"] = fallback_mod
+
+            # Also ensure the parent package is registered so that
+            # ``from .mesh_inpaint_processor import ...`` inside
+            # MeshRender.py can resolve correctly.
+            if "DifferentiableRenderer" not in sys.modules:
+                dr_pkg = types.ModuleType("DifferentiableRenderer")
+                dr_pkg.__path__ = [str(paint_root / "DifferentiableRenderer")]
+                dr_pkg.__package__ = "DifferentiableRenderer"
+                sys.modules["DifferentiableRenderer"] = dr_pkg
+
             logger.warning(
                 "mesh_inpaint_processor extension unavailable; using simplified UV "
                 "inpaint fallback."
@@ -221,9 +310,11 @@ class Hunyuan3DPaintWrapper:
         instead of RealESRGAN 4x super-resolution, textures are upscaled
         with PIL Lanczos resampling.  Quality is slightly lower but the
         pipeline remains fully functional.
-        """
-        import importlib
 
+        NOTE: ``_prepare_paint_imports`` must be called first to ensure that
+        ``sys.modules["utils"]`` already points to the real
+        ``hy3dpaint/utils`` package with a correct ``__path__``.
+        """
         # Check if realesrgan is actually importable.
         try:
             importlib.import_module("realesrgan")
@@ -259,23 +350,12 @@ class Hunyuan3DPaintWrapper:
         fallback_mod.imageSuperNet = _LanczosSuperNet
         sys.modules["utils.image_super_utils"] = fallback_mod
 
-        # Attach the fallback as an attribute of the *real* ``utils`` package
-        # that lives inside ``hy3dpaint/``.  Earlier code
-        # (``_prepare_paint_imports``) already placed ``hy3dpaint/`` on
-        # ``sys.path``, so ``import utils`` resolves to the filesystem package.
-        # We must NOT create a bare ``types.ModuleType("utils")`` stub here
-        # because that would shadow the real package and break every other
-        # ``from utils.<submod> import ...`` in the Paint codebase (e.g.
-        # ``utils.simplify_mesh_utils``).
-        if "utils" not in sys.modules:
-            try:
-                import utils  # noqa: F401 — imports the real hy3dpaint/utils package
-            except ImportError:
-                # Last resort: create a namespace stub only if the real
-                # package genuinely cannot be found on sys.path.
-                sys.modules["utils"] = types.ModuleType("utils")
-        parent = sys.modules["utils"]
-        if not hasattr(parent, "image_super_utils"):
+        # Attach the fallback as an attribute of the ``utils`` package.
+        # ``_prepare_paint_imports`` already ensured that
+        # ``sys.modules["utils"]`` is the real hy3dpaint/utils package
+        # with the correct ``__path__``, so we just attach the sub-module.
+        parent = sys.modules.get("utils")
+        if parent is not None and not hasattr(parent, "image_super_utils"):
             parent.image_super_utils = fallback_mod
 
     def _ensure_python_dependencies(self, code_root: Path) -> None:

@@ -13,9 +13,14 @@ import trimesh
 logger = logging.getLogger(__name__)
 
 
-def remove_small_components(mesh, min_face_ratio=0.05):
+def remove_small_components(mesh, min_face_ratio=0.01):
     """Remove disconnected components smaller than *min_face_ratio* of the
     largest component (by face count).
+
+    A ratio of 0.01 (1 %) is conservative enough to preserve meaningful
+    sub-parts like staffs, flames, or accessories while still removing
+    tiny artefacts from marching-cubes.  The previous default of 0.05
+    could incorrectly delete small but important geometry.
 
     Parameters
     ----------
@@ -215,6 +220,18 @@ def decimate_mesh(mesh, target_face_count=None, target_ratio=0.5):
         target / current_faces,
     )
 
+    # Warn if the mesh has UV data that will be discarded by decimation.
+    has_uvs = (
+        hasattr(mesh.visual, "uv")
+        and mesh.visual.uv is not None
+        and len(mesh.visual.uv) > 0
+    )
+    if has_uvs:
+        logger.warning(
+            "decimate_mesh: mesh has UV coordinates that will be discarded "
+            "during decimation.  Re-run UV unwrapping after this step."
+        )
+
     # --- Backend 1: fast-simplification (Cython, fastest CPU option) -------
     def _decimate_fast_simplification():
         try:
@@ -234,10 +251,18 @@ def decimate_mesh(mesh, target_face_count=None, target_ratio=0.5):
                 vertices=pts_out, faces=faces_out, process=False,
             )
             elapsed = time.time() - t0
+            actual = len(decimated.faces)
             logger.info(
-                "decimate_mesh: fast-simplification result has %d faces (%.2fs).",
-                len(decimated.faces), elapsed,
+                "decimate_mesh: fast-simplification result has %d faces "
+                "(target %d, %.2fs).",
+                actual, target, elapsed,
             )
+            if actual > target * 1.5:
+                logger.warning(
+                    "decimate_mesh: fast-simplification overshot target "
+                    "(%d vs %d). Result may have more polygons than expected.",
+                    actual, target,
+                )
             return decimated
         except Exception as exc:
             logger.warning(
@@ -578,7 +603,7 @@ def repair_and_prepare(mesh, decimate_ratio=None, smooth_iterations=3):
     except Exception:
         pass
 
-    # Step 6 -- final validation
+    # Step 8 -- final validation
     logger.info("repair_and_prepare: final validation.")
     metrics = validate_mesh(mesh)
 

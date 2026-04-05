@@ -125,30 +125,42 @@ class MVAdapterWrapper:
     # MVImageProcessorV2: the label describes which side of the object the
     # camera *sees*, NOT where the camera is positioned.
     #
-    # MV-Adapter's camera rig applies a -90 degree offset internally (see
-    # ``_setup_cameras``).  This means the camera at input azimuth 0 ends
-    # up at position azimuth -90 in the world, looking at the object's
-    # **left** side — NOT the front.  Empirical testing confirms:
+    # Per the MV-Adapter paper (arXiv 2412.03632, Figures 12-14):
     #
-    #   Azimuth   0 -> camera sees LEFT   -> "left"
-    #   Azimuth  90 -> camera sees BACK   -> "back"
-    #   Azimuth 180 -> camera sees RIGHT  -> "right"
-    #   Azimuth 270 -> camera sees FRONT  -> "front"
+    #   "The azimuth angles of the images from left to right are
+    #    0, 45, 90, 180, 270, 315, corresponding to the front,
+    #    front-left, left, back, right, and front-right of the object."
     #
-    # This matches MVImageProcessorV2.view2idx:
-    #   {'front': 0, 'left': 1, 'back': 2, 'right': 3}
+    # The -90 degree offset applied in ``_setup_cameras`` is part of the
+    # camera *construction* math (matching MV-Adapter's own inference
+    # script). The camera position is computed as:
+    #   (cos(az - 90°), sin(az - 90°), 0)
+    #
+    # Empirically confirmed view mapping (effective world azimuths after offset):
+    #   Input az   0° -> effective -90° -> camera at (0, -1) -> FRONT  (confirmed)
+    #   Input az  45° -> effective -45° -> camera at (+0.7, -0.7) -> FRONT-RIGHT diagonal
+    #   Input az  90° -> effective   0° -> camera at (+1, 0)      -> RIGHT side (confirmed wrong as "left")
+    #   Input az 180° -> effective +90° -> camera at (0, +1)      -> BACK  (confirmed)
+    #   Input az 270° -> effective +180°-> camera at (-1, 0)      -> LEFT side (confirmed wrong as "right")
+    #   Input az 315° -> effective +225°-> camera at (-0.7, -0.7) -> FRONT-LEFT diagonal
+    #
+    # The paper's label convention has left/right swapped relative to the
+    # empirical output.  The AZIMUTH_MAP below uses the empirically correct
+    # labels so CARDINAL_KEYS selects the right output images.
+    #
+    # MVImageProcessorV2.view2idx = {'front': 0, 'left': 1, 'back': 2, 'right': 3}
     AZIMUTH_DEG = [0, 45, 90, 180, 270, 315]
     AZIMUTH_MAP = {
-        0: ("left", 0),             # cardinal: sees object's left
-        1: ("back_left_45", 45),
-        2: ("back", 90),            # cardinal: sees object's back
-        3: ("right", 180),          # cardinal: sees object's right
-        4: ("front", 270),          # cardinal: sees object's front
-        5: ("front_left_315", 315),
+        0: ("front", 0),            # confirmed: sees object's front
+        1: ("front_right", 45),     # diagonal (front-right in world space)
+        2: ("right", 90),           # confirmed empirically: sees object's RIGHT (paper says "left")
+        3: ("back", 180),           # confirmed: sees object's back
+        4: ("left", 270),           # confirmed empirically: sees object's LEFT  (paper says "right")
+        5: ("front_left", 315),     # diagonal (front-left in world space)
     }
 
     # Cardinal views expected by Hunyuan3D-2mv MVImageProcessorV2
-    CARDINAL_KEYS = {"front": 4, "left": 0, "back": 2, "right": 3}
+    CARDINAL_KEYS = {"front": 0, "left": 4, "back": 3, "right": 2}
 
     # Output resolution
     OUTPUT_SIZE = 768

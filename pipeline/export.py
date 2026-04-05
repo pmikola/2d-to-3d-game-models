@@ -152,16 +152,20 @@ def export_textured_dir_to_glb(textured_dir: str, output_path: str) -> str:
     if obj_path is None:
         raise FileNotFoundError(f"No .OBJ file found in {textured_dir}")
 
-    # Find texture file
+    # Find texture file — try specific albedo names first, then fall back to
+    # any image file that is *not* a known PBR map (normal, roughness, metallic).
+    _non_albedo_stems = {"normal", "normal_map", "roughness", "roughness_map",
+                         "metallic", "metallic_map", "ao", "occlusion", "bump"}
     texture_path = None
     texture_patterns = ["texture_atlas.*", "albedo.*", "diffuse.*", "material_0.*", "*.png", "*.jpg"]
     for pattern in texture_patterns:
         matches = list(textured_path.glob(pattern))
-        # Filter to image files only
+        # Filter to image files only, excluding known non-albedo maps
         image_matches = [
             m for m in matches
             if m.suffix.lower() in {".png", ".jpg", ".jpeg"}
             and m.stem != obj_path.stem  # Don't pick up the OBJ filename
+            and m.stem.lower() not in _non_albedo_stems
         ]
         if image_matches:
             texture_path = image_matches[0]

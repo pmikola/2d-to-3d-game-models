@@ -390,9 +390,14 @@ class Pipeline:
                     self._zero123.unload()
                     release_runtime_memory("after_mvadapter_stage")
 
-                # Save multi-view debug images
+                # Save multi-view debug images — include azimuth in filename so
+                # it is easy to diagnose which azimuth produces which view.
+                _name_to_az = {
+                    name: az for _idx, (name, az) in self._zero123.AZIMUTH_MAP.items()
+                }
                 for view_name, view_img in views.items():
-                    view_path = output_dir / f"{Path(input_path).stem}_view_{view_name}.png"
+                    az_deg = _name_to_az.get(view_name, "?")
+                    view_path = output_dir / f"{Path(input_path).stem}_view_{view_name}_az{az_deg}.png"
                     view_img.save(str(view_path))
                 logger.info(f"Saved {len(views)} multi-view images for debugging.")
 
@@ -625,7 +630,16 @@ class Pipeline:
                                 "Fallback: UV unwrap complete in %.1fs.",
                                 time.time() - fb_uv_t0,
                             )
-                            intermediate_obj = save_mesh_as_obj(mesh, tmp_dir)
+
+                        # Always re-save the OBJ after fallback decimation
+                        # and/or UV unwrap so the texture generator gets the
+                        # current mesh (not the pre-decimation version from
+                        # Stage 3).
+                        intermediate_obj = save_mesh_as_obj(mesh, tmp_dir)
+
+                        # Update result counts to reflect fallback mesh state.
+                        result.mesh_vertices = len(mesh.vertices)
+                        result.mesh_faces = len(mesh.faces)
 
                         # Reduce viewpoints for faster fallback texturing.
                         # The full pipeline uses up to 36 viewpoints which is
@@ -659,6 +673,9 @@ class Pipeline:
                             # Restore original viewpoint count so it doesn't
                             # affect any subsequent runs in a batch.
                             self.device_config.texture_num_viewpoints = original_viewpoints
+                            # Release the SD2 pipeline VRAM loaded by the
+                            # fallback TextureGenerator.
+                            release_runtime_memory("after_fallback_texture_stage")
 
                         fallback_elapsed = time.time() - fallback_t0
                         logger.info(

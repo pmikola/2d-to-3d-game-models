@@ -314,6 +314,19 @@ def save_mesh_as_obj(mesh, output_path: str) -> str:
     output_dir = Path(output_path)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Warn if UV data is missing — the OBJ will lack vt entries and
+    # downstream texturing tools (Text2Tex / TEXTure) will fail.
+    has_uvs = (
+        hasattr(mesh.visual, "uv")
+        and mesh.visual.uv is not None
+        and len(mesh.visual.uv) > 0
+    )
+    if not has_uvs:
+        logger.warning(
+            "save_mesh_as_obj: mesh has no UV coordinates.  The exported OBJ "
+            "will lack texture coordinates, which may cause texturing failures."
+        )
+
     obj_path = output_dir / "mesh.obj"
     mesh.export(str(obj_path), file_type="obj")
 
@@ -330,13 +343,16 @@ def normalize_mesh(mesh) -> None:
     Args:
         mesh: trimesh.Trimesh object (modified in-place).
     """
-    # Center at origin
-    centroid = mesh.vertices.mean(axis=0)
-    mesh.vertices -= centroid
+    # Center at bounding-box midpoint (not vertex mean, which is biased
+    # toward regions with higher vertex density).
+    vmin = mesh.vertices.min(axis=0)
+    vmax = mesh.vertices.max(axis=0)
+    center = (vmin + vmax) / 2.0
+    mesh.vertices -= center
 
     # Scale to unit bounding box
-    bounds = mesh.vertices.max(axis=0) - mesh.vertices.min(axis=0)
-    max_extent = bounds.max()
+    extents = vmax - vmin
+    max_extent = extents.max()
     if max_extent > 0:
         mesh.vertices /= max_extent
 

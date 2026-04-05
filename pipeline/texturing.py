@@ -485,7 +485,7 @@ class TextureGenerator:
             # Convert depth to PIL Image
             depth_normalized = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
             depth_uint8 = (depth_normalized * 255).astype(np.uint8)
-            return Image.fromarray(depth_uint8)
+            return Image.fromarray(depth_uint8).convert("RGB")
 
         except Exception as exc:
             logger.debug(
@@ -499,7 +499,7 @@ class TextureGenerator:
             y, x = np.ogrid[-center:resolution - center, -center:resolution - center]
             mask = x * x + y * y <= radius * radius
             depth[mask] = 200
-            return Image.fromarray(depth)
+            return Image.fromarray(depth).convert("RGB")
 
     @staticmethod
     def _look_at(eye, target, up):
