@@ -5,7 +5,7 @@ from setuptools import find_packages, setup
 setup(
     name="image-to-3d-pipeline",
     version="0.1.0",
-    description="Convert 2D images to geometry-only 3D models (.GLB) using Hunyuan3D-2.1 fp16 by default",
+    description="Convert 2D images to fully textured PBR 3D models (.GLB) using Hunyuan3D-2.1",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
     author="2D-to-3D Pipeline Contributors",
@@ -44,7 +44,7 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "image-to-3d=run:main",
+            "image-to-3d=generate:main",
         ],
     },
     classifiers=[

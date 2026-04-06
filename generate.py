@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """
-Simplified 2D-to-3D pipeline — closely matches Hunyuan3D-2.1's official demo.py.
+2D-to-3D Game Model Generator
 
-Produces a fully textured PBR GLB model from a single input image.
-Works on 16 GB VRAM (RTX 3080 Ti) via MMGP memory offloading for the paint stage.
+Converts a single 2D image (PNG/JPG) into a fully textured PBR 3D model (.GLB).
+
+Pipeline:
+  Stage 1: Hunyuan3D-2.1 — single-image 3D shape generation
+  Stage 2: Hunyuan3D Paint — PBR texture painting (albedo, roughness, metallic)
+
+Output is saved to output/<image_name>/ with both shape-only and textured GLB files.
+Works on 16 GB VRAM (e.g. RTX 3080 Ti) via MMGP memory offloading.
 
 Usage:
-    python run_simple.py image_0001.png
-    python run_simple.py image_0001.png --output wizard.glb
-    python run_simple.py image_0001.png --output wizard.glb --octree 512 --paint-views 6
+    python generate.py wizard.png
+    python generate.py wizard.png --output output/wizard/wizard.glb
+    python generate.py wizard.png --octree 512 --paint-views 6
+    python generate.py wizard.png --no-texture
 """
 
 import argparse

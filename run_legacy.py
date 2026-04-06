@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 """
-2D-to-3D Game Models Pipeline — CLI Entry Point
+2D-to-3D Game Models Pipeline — Legacy Orchestrator
 
-Convert 2D images (PNG/JPG) to 3D shape models (.GLB) for Blender.
+NOTE: For the recommended pipeline, use generate.py instead:
+    python generate.py image.png
 
-Default pipeline:
-  Stage 1: Hunyuan3D-2.1 fp16 — high-quality 3D shape generation
-  Stage 2: Game-ready decimation + geometry-only GLB export
-
-Legacy pipeline:
-  Hi3DGen + Text2Tex remains available via `--backend hi3dgen`
+This script provides the legacy multi-backend orchestrator with support for
+Hi3DGen, TripoSG, Hunyuan3D, and the experimental "full" 5-stage pipeline.
+It uses the pipeline/ package which has many moving parts. The simpler
+generate.py script is more reliable for standard Hunyuan3D shape + paint.
 
 Usage:
-  python run.py --input photo.png --output model.glb
-  python run.py --batch-dir ./images/ --output-dir ./models/
-  python run.py --input photo.png --output model.glb --force-cpu
+  python run_legacy.py --input photo.png --output model.glb
+  python run_legacy.py --batch-dir ./images/ --output-dir ./models/
+  python run_legacy.py --input photo.png --backend full --multiview
 """
 
 import argparse
